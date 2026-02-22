@@ -1,4 +1,10 @@
+python-socketio==5.11.0
+python-engineio==4.8.0
+eventlet>=0.30.2
+gunicorn==22.0.0
 requests
 supabase
 flask
-gunicorn
+pandas
+websocket-client
+loguru
