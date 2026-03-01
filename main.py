@@ -1,75 +1,75 @@
 import eventlet
 eventlet.monkey_patch()
 import os
+import json
 import datetime
 import requests
 import firebase_admin
 from firebase_admin import credentials, db
 
-# --- 1. FIREBASE SETUP ---
-# Dhyaan rakhein ki serviceAccountKey.json aapke folder mein ho
-cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred, {
-    'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'
-})
+# --- 1. FIREBASE AUTHENTICATION ---
+# Aapne jo JSON diya tha, usey yahan config mein daal diya hai
+service_account_info = {
+  "type": "service_account",
+  "project_id": "trade-f600a",
+  "private_key_id": "d3414fc3a948f93409e6f4038f683341f82a9c2a",
+  "private_key": os.environ.get("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n') if os.environ.get("FIREBASE_PRIVATE_KEY") else "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDHLXAZg4YsBJXI\ndSYFnEgKPWUPSv7trW6CXUDS4R6PolwebzqSJZ3FGr1mk4IgOM0Vkku3djnkMjqM\nDxUgJFjgH2N44HmSpMDbuEfBhd/fYZ7sNI6uNXsHEhK1hBwZJyXy7D1KGaIxqlaI\n9I/kzl+3wtbTcLH0xsLSGz+w5plsZpI134u+y/ZhcDOuZywAhZgQ6NlxjRZpdLwn\nUx+vIoTFUTWjIoCmd3DNE6JoTPN7CBstP9YpcNoy87MBjKoNpX+lTBrmlwku1zlO\n1O7kip7trnMy4b/hNu9PvLeEyeMIWqBLCiSVkv9FGgPsMxHmpnpAnQO+VcAyczJM\ncJOXITBXAgMBAAECggEAD5uMZrtrNqTPVet0JMlnzcGc2zNtwZMvDzEehMfWPLwk\nys+9f7lJ4SmkwNZ7QmohC/kwTLqLc8nJ07LU3XVrr3hWM6EndanKYQ1SNiR29Aqy\nyOCfc6BGOTod1DJ7fy8VprEDZnyWvJyT9lxvsCbJ0l0Gt3/jugIfPxaaiZKwYBGQ\nK1Vy+2kFq8UjK9C7Izr8+B85qYyuDG4JovT8lu8gd6OCTz2UzUvGZfao+koUSibY\nyTd9OC4uxKQDn9Ylpgn50sns6GSkzsKb9UGtIgt/P3WlnDjwcQlNy3VDqrP61aNG\n7z14hzbq8rzgFdGWo5Yar7O5A1tW3K76v6My8jjAzQKBgQDl7s1mgaPW0+WoGQDC\nTrQTBSLctulyApUWajH9oXV0QuqpBWZ4PE8UzYV7PEEB9akG3WUoAq0IpjAMaJYR\nRgSy3M6KZ6Njo/i75LzerxUl0hLKWC0otkgBIc583cV8HrvWweHwvGPjBfxQK+Ka\ngD/OoqY6UkndAj3HzbsffWlSSwKBgQDdwgrtMMtAFvwUWNA4S8vG8OUg9KWBs4/p\nFc4IQq4EO7c7jJEit1hatxjC5zPE2D0cPBmq89+2MQciGyfS0d2sKy3lUrun9wVW\nHXggxcpZ+rAegTLswoMdf4FzwZRW4Vb53RUr9oXdVEknin5axyVhIJK6nOfpEcI+\nOR9BCLWypQKBgBd6fvbMnhI9qOG1S+KLbs/SYnDvLH87zEVxqpEff4LTomqH5qK4\nZcrWAZ9H08uDbjMJQF8JhumvLpDVzR0ObURmT6DKXGC8SZXGEZMbhalK/igzQMk7\nc7bJ4O/XJWc7LCsNuSh/1CNGZTE6ifUEy38qFJc399rdc7mHRGg+whZpAoGBALKo\n4qS16wp3eh/qbdbtOf/NlMw4Th9wy0C+kH+XORuwAK+5UDToAgcT/J8KJmswzAsz\nYHqagGIInfacajkvW6iaIR/gx89K9MGsfFvq/lv/3GS3MpANJhVd5K2eCCT251vn\nAmeo9bCbd1Sj/6ijSTo3Q/+U6kKcTCJVYxjCK6EBAoGBAJdM1ZMN19uQpZ7tP6cO\nvc+FDoA1xLAgFlB7X/xfUxtkwHxUCEcaCax6LfZgNSXDqyFa3/2Wx4edCfLQU7ol\n4MrEOfmmbI20WIjZyxyG5pAfByyNX2fGWzLIAV0xhVNhxOmgHZOeVxeXCCOBhvB5\nu2i5Xdu5JRZ/AEBH+C6bJC2d\n-----END PRIVATE KEY-----\n",
+  "client_email": "firebase-adminsdk-fbsvc@trade-f600a.iam.gserviceaccount.com",
+  "client_id": "105189844130830324690",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40trade-f600a.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
 
-# --- 2. BATCH SYNC ENGINE (CRYPTO/FOREX) ---
+if not firebase_admin._apps:
+    cred = credentials.Certificate(service_account_info)
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'
+    })
+
+# --- 2. BATCH SYNC ENGINE ---
 def sync_forex_batch():
-    print("🚀 Binance Forex/Crypto Batch Engine Started...")
-    print("✅ Mode: No Double Subscription | Multi-User Live")
-    
+    print("🚀 Binance Batch Engine Running...")
     while True:
         try:
-            # Step A: Firebase se puri watchlist ek baar mein uthao
             all_data = db.reference('forex_watchlist').get()
-            
             if all_data:
-                # Step B: Unique symbols nikalna (Taaki Binance ko ek hi request jaye)
-                # Agar 100 users ne BTCUSDT dala hai, toh set() use sirf ek baar count karega
+                # Unique symbols extract (No double request)
                 unique_symbols = {key.split('_')[0] for key in all_data.keys()}
                 
                 for sym in unique_symbols:
-                    # Step C: Binance Public API se price fetch karna
                     url = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
                     res = requests.get(url, timeout=5).json()
                     
                     if 'price' in res:
-                        raw_price = float(res['price'])
-                        # Price formatting (Badi price ke liye 2 decimal, choti ke liye 6)
-                        formatted_price = "{:.2f}".format(raw_price) if raw_price > 1 else "{:.6f}".format(raw_price)
-                        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                        price = float(res['price'])
+                        fmt_price = "{:.2f}".format(price) if price > 1 else "{:.6f}".format(price)
+                        ts = datetime.datetime.now().strftime("%H:%M:%S")
                         
-                        # Step D: Batch Update Dictionary taiyar karna
-                        # Is ek price ko un sabhi users ke nodes mein map karo jinhone ye symbol add kiya hai
-                        batch_updates = {}
+                        updates = {}
                         for node_key in all_data.keys():
                             if node_key.startswith(sym):
-                                batch_updates[f"{node_key}/price"] = float(formatted_price)
-                                batch_updates[f"{node_key}/utime"] = timestamp
+                                updates[f"{node_key}/price"] = float(fmt_price)
+                                updates[f"{node_key}/utime"] = ts
                         
-                        # Step E: Ek single call mein Firebase update (Fastest Way)
-                        if batch_updates:
-                            db.reference('forex_watchlist').update(batch_updates)
+                        if updates:
+                            db.reference('forex_watchlist').update(updates)
             
-            # Har 1.5 second mein loop chalega real-time feel ke liye
-            eventlet.sleep(1.5)
-            
+            eventlet.sleep(1.2) # Thoda fast sync
         except Exception as e:
-            print(f"⚠️ Sync Error: {e}")
+            print(f"⚠️ Error: {e}")
             eventlet.sleep(5)
 
-# --- 3. RENDER WEB SERVER BINDING ---
+# --- 3. RENDER SERVER ---
 if __name__ == '__main__':
-    # Engine ko background thread mein start karein
     eventlet.spawn(sync_forex_batch)
-    
-    # Render Dashboard par 'Live' status dikhane ke liye mini server
     from eventlet import wsgi
     port = int(os.environ.get("PORT", 10000))
+    def app(env, res):
+        res('200 OK', [('Content-Type', 'text/plain')])
+        return [b"Binance Batch Sync Active"]
     
-    def render_health_check(env, start_response):
-        start_response('200 OK', [('Content-Type', 'text/plain')])
-        return [b"Forex/Crypto Engine is Live and Syncing!"]
-    
-    print(f"🌍 Server binding on port {port}")
-    wsgi.server(eventlet.listen(('0.0.0.0', port)), render_health_check)
+    print(f"🌍 Live on port {port}")
+    wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
