@@ -8,10 +8,18 @@ from firebase_admin import credentials, db
 firebase_config_env = os.environ.get("FIREBASE_CONFIG")
 
 if firebase_config_env:
-    # Render variables se JSON load karega
-    service_account_info = json.loads(firebase_config_env)
+    try:
+        # Render variables se JSON load karega
+        service_account_info = json.loads(firebase_config_env)
+        
+        # IMPORTANT: Private key ki formatting fix (JWT errors se bachne ke liye)
+        if "private_key" in service_account_info:
+            service_account_info["private_key"] = service_account_info["private_key"].replace('\\n', '\n')
+            
+    except Exception as e:
+        print(f"❌ JSON Parsing Error: {e}")
+        exit(1)
 else:
-    # Agar local test kar rahe ho toh purani key backup
     print("⚠️ Environment variable FIREBASE_CONFIG not found!")
     exit(1)
 
@@ -26,9 +34,11 @@ def sync_forex_batch():
     print("🚀 Binance Engine Running. Connecting to Firebase...")
     while True:
         try:
+            # Step A: Watchlist fetch karna
             watchlist = db.reference('forex_watchlist').get()
+            
             if watchlist:
-                # Unique symbols nikalna (BTCUSDT_UID -> BTCUSDT)
+                # Unique symbols nikalna (e.g., BTCUSDT_UID1 -> BTCUSDT)
                 unique_symbols = {key.split('_')[0] for key in watchlist.keys()}
                 
                 for sym in unique_symbols:
@@ -37,30 +47,39 @@ def sync_forex_batch():
                     
                     if 'price' in res:
                         p_val = float(res['price'])
-                        # 1 se badi price (BTC) ke liye 2 decimal, choti ke liye 6
+                        # Formatting: Badi price ke liye 2 decimal, choti ke liye 6
                         fmt_p = "{:.2f}".format(p_val) if p_val > 1 else "{:.6f}".format(p_val)
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
                         
+                        # Step B: Batch Updates taiyar karna
                         updates = {}
                         for node_key in watchlist.keys():
                             if node_key.startswith(sym):
                                 updates[f"{node_key}/price"] = float(fmt_p)
                                 updates[f"{node_key}/utime"] = ts
                         
+                        # Step C: Firebase update
                         if updates:
                             db.reference('forex_watchlist').update(updates)
                             print(f"✅ Synced {sym}: {fmt_p}")
             
-            eventlet.sleep(1.2) # Fast sync
+            eventlet.sleep(1.5) # API limits aur speed ka balance
+            
         except Exception as e:
             print(f"⚠️ Engine Error: {e}")
             eventlet.sleep(5)
 
+# --- 3. RENDER HEALTH CHECK SERVER ---
 if __name__ == '__main__':
+    # Background engine start
     eventlet.spawn(sync_forex_batch)
+    
     from eventlet import wsgi
     port = int(os.environ.get("PORT", 10000))
+    
     def app(e, r):
         r('200 OK', [('Content-Type', 'text/plain')])
-        return [b"Sync Engine Live"]
+        return [b"Sync Engine is Live and Running!"]
+    
+    print(f"🌍 Health Check Server on port {port}")
     wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
