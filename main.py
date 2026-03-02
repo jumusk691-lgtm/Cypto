@@ -14,12 +14,12 @@ if not firebase_admin._apps:
     })
 print("✅ Firebase Connected!")
 
-# Global Controls
+# Global States
 already_subscribed = set()
 last_price_cache = {}
 ws_app = None
 
-# --- 2. UPDATE LOGIC ---
+# --- 2. UPDATE LOGIC (Optimized) ---
 def update_firebase(symbol, price):
     global last_price_cache
     try:
@@ -40,17 +40,16 @@ def update_firebase(symbol, price):
                 search_target = clean_name.replace("1000", "") if multiplier > 1.0 else clean_name
                 
                 if search_target == symbol or f"{search_target}USDT" == symbol:
-                    final_price = float(price) * multiplier
-                    updates[f"{node_key}/price"] = f"{final_price:.8f}".rstrip('0').rstrip('.')
+                    final_p = float(price) * multiplier
+                    updates[f"{node_key}/price"] = f"{final_p:.8f}".rstrip('0').rstrip('.')
                     updates[f"{node_key}/utime"] = now
             
             if updates:
                 ref.update(updates)
-                print(f"📡 {symbol} -> {price}")
+                # print(f"📡 {symbol} -> {price}") # Logs saaf rakhne ke liye band kar sakte hain
                 del updates
-                
     except Exception as e:
-        print(f"⚠️ FB Error: {e}")
+        print(f"⚠️ FB Update Error: {e}")
 
 # --- 3. BATCHED SUBSCRIPTION ---
 def manage_subscriptions(current_list):
@@ -63,12 +62,13 @@ def manage_subscriptions(current_list):
     batch_size = 100
     for i in range(0, len(new_to_add), batch_size):
         batch = new_to_add[i:i + batch_size]
-        ws_app.send(json.dumps({"op": "subscribe", "args": [f"tickers.{s}" for s in batch]}))
+        msg = {"op": "subscribe", "args": [f"tickers.{s}" for s in batch]}
+        ws_app.send(json.dumps(msg))
         for s in batch: already_subscribed.add(s)
         print(f"✅ Batch Subscribed: {len(batch)} symbols")
         eventlet.sleep(0.3)
 
-# --- 4. WEBSOCKET ENGINE (STABLE) ---
+# --- 4. STABLE WEBSOCKET ENGINE ---
 def on_message(ws, message):
     data = json.loads(message)
     if 'data' in data:
@@ -85,9 +85,10 @@ def run_ws_engine():
             ws_app = websocket.WebSocketApp(
                 "wss://stream.bybit.com/v5/public/linear",
                 on_message=on_message,
+                on_error=lambda w, e: print(f"⚠️ WS Error: {e}"),
                 on_close=lambda w, c, r: print("🔌 Connection Lost. Reconnecting...")
             )
-            # FIX: Adding Ping to keep connection alive
+            # FIX: Ping interval connection stable rakhega
             ws_app.run_forever(ping_interval=20, ping_timeout=10)
         except: pass
         time.sleep(5)
@@ -98,14 +99,14 @@ def sync_watchlist():
         try:
             watchlist = db.reference('forex_watchlist').get()
             if watchlist:
-                symbols = [node_key.split('_')[0].upper() for node_key in watchlist.keys()]
-                # Ensure USDT suffix for Bybit
-                symbols = [s if s.endswith("USDT") else s + "USDT" for s in symbols]
+                symbols = []
+                for node_key in watchlist.keys():
+                    s = node_key.split('_')[0].upper()
+                    if not s.endswith("USDT"): s += "USDT"
+                    symbols.append(s)
                 manage_subscriptions(symbols)
             eventlet.sleep(30)
-        except Exception as e:
-            print(f"⚠️ Sync Error: {e}")
-            eventlet.sleep(10)
+        except: eventlet.sleep(10)
 
 # --- 6. HEALTH CHECK ---
 def application(env, start_response):
