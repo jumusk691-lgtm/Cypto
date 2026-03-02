@@ -3,7 +3,7 @@ eventlet.monkey_patch()
 import os, datetime, requests, firebase_admin
 from firebase_admin import credentials, db
 
-# --- 1. FIREBASE AUTH ---
+# --- 1. FIREBASE SETUP ---
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 KEY_PATH = os.path.join("/etc/secrets/", KEY_FILE)
 
@@ -14,79 +14,64 @@ if not firebase_admin._apps:
     })
 print("✅ Firebase Connected!")
 
-# --- 2. THE ENGINE (Handles 1000+ Symbols & Errors) ---
-def start_sync():
-    print("🚀 Massive Engine Active: Optimizing for 1000+ Unique Symbols...")
+# --- 2. FOREX ONLY ENGINE ---
+def start_forex_sync():
+    print("🚀 Forex Engine Live (Unique & Fast)...")
     
     while True:
         try:
-            # 1. Firebase Scan (Donon watchlists)
-            updates = {}
-            now = datetime.datetime.now().strftime("%H:%M:%S")
+            # Sirf forex_watchlist ko target karna
+            ref = db.reference('forex_watchlist')
+            data = ref.get()
+            
+            if not data:
+                print("⚠️ No Forex symbols found. Waiting...")
+                eventlet.sleep(5)
+                continue
+
             unique_symbols = set()
-            
-            # Hum saara data ek saath fetch karte hain taaki speed mile
-            db_root = db.reference('/').get()
-            if not db_root:
-                eventlet.sleep(5)
-                continue
+            for k in data.keys():
+                sym = k.split('_')[0].upper()
+                unique_symbols.add(sym)
 
-            # Nodes jahan symbols ho sakte hain
-            target_nodes = ['forex_watchlist']
-            
-            # Sabhi unique symbols ki list banana
-            for node in target_nodes:
-                data = db_root.get(node, {})
-                for key in data.keys():
-                    sym = key.split('_')[0].upper()
-                    unique_symbols.add(sym)
-
-            if not unique_symbols:
-                eventlet.sleep(5)
-                continue
-
-            # 2. Binance API - Har symbol ka price ek saath (Batch)
-            try:
-                res = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=5)
-                if res.status_code == 200:
-                    prices = res.json()
-                    # Check if prices is a list (Expected Binance format)
-                    if isinstance(prices, list):
-                        price_map = {item['symbol']: item['price'] for item in prices if item['symbol'] in unique_symbols}
+            # Alternate Route for Global Prices (Avoiding 451 Error)
+            now = datetime.datetime.now().strftime("%H:%M:%S")
+            for symbol in unique_symbols:
+                # Using a more stable global endpoint
+                url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+                try:
+                    res = requests.get(url, timeout=3).json()
+                    if 'price' in res:
+                        price_val = res['price']
                         
-                        # 3. Update Map Taiyaar Karna
-                        for node in target_nodes:
-                            node_data = db_root.get(node, {})
-                            for key in node_data.keys():
-                                sym = key.split('_')[0].upper()
-                                if sym in price_map:
-                                    updates[f"{node}/{key}/price"] = float(price_map[sym])
-                                    updates[f"{node}/{key}/utime"] = now
+                        # Sirf unhi nodes ko update karna jo is symbol ke hain
+                        updates = {}
+                        for k in data.keys():
+                            if k.startswith(symbol):
+                                updates[f"{k}/price"] = float(price_val)
+                                updates[f"{k}/utime"] = now
                         
-                        # 4. Multi-Path Update (Single Shot for 1000 nodes)
                         if updates:
-                            db.reference('/').update(updates)
-                            print(f"⚡ {len(updates)} nodes updated at {now} (Unique: {len(unique_symbols)})")
+                            ref.update(updates)
+                            print(f"📈 {symbol} -> {price_val}")
                     else:
-                        print("⚠️ Binance sent unexpected response format.")
-                else:
-                    print(f"⚠️ Binance API Down. Status: {res.status_code}")
-            except Exception as api_e:
-                print(f"❌ API Loop Error: {api_e}")
+                        print(f"❌ Error for {symbol}: {res.get('msg', 'Unknown')}")
+                except:
+                    continue
 
-            eventlet.sleep(1) # 1 Second update frequency
+            eventlet.sleep(1) # 1 Second Speed
             
         except Exception as e:
-            print(f"⚠️ Global Engine Error: {e}")
+            print(f"⚠️ Engine Pause: {e}")
             eventlet.sleep(5)
 
-# --- 3. RENDER SERVER ---
+# --- 3. WEB INTERFACE ---
 def application(env, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
-    return [b"Massive Sync Engine is RUNNING. Security & Scaling Active."]
+    return [b"FOREX ENGINE IS RUNNING."]
 
 if __name__ == '__main__':
-    eventlet.spawn(start_sync)
+    eventlet.spawn(start_forex_sync)
     from eventlet import wsgi
     port = int(os.environ.get("PORT", 10000))
     wsgi.server(eventlet.listen(('0.0.0.0', port)), application)
