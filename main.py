@@ -10,56 +10,61 @@ KEY_PATH = os.path.join("/etc/secrets/", KEY_FILE) if os.path.exists("/etc/secre
 if not firebase_admin._apps:
     cred = credentials.Certificate(KEY_PATH)
     firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
-print("✅ Firebase Connected to forex_watchlist engine!")
+print("✅ Firebase Connected!")
 
+# Global States
 already_subscribed = set()
 last_price_cache = {}
+watchlist_data = {} # Local copy taaki baar-baar fetch na karna pade
 ws_app = None
 
-# --- 2. THE ULTIMATE MATCHING ENGINE ---
+# --- 2. FIREBASE LISTENER (Zaruri Badlav) ---
+def start_watchlist_listener():
+    """Ye function Firebase mein badlav hote hi apne aap local data update kar dega"""
+    global watchlist_data
+    def listener(event):
+        global watchlist_data
+        data = db.reference('forex_watchlist').get()
+        if data:
+            watchlist_data = data
+            # Naye symbols ko turant subscribe karne ki koshish karein
+            sync_now()
+            
+    db.reference('forex_watchlist').listen(listener)
+
+# --- 3. THE UPDATED MATCHING ENGINE ---
 def update_firebase(incoming_symbol, price):
-    global last_price_cache
+    global last_price_cache, watchlist_data
     try:
         if not price or float(price) <= 0: return
-        
-        # Filtering: Agar price wahi hai jo cache mein hai, toh aage mat badho
         p_str = str(price)
-        if last_price_cache.get(incoming_symbol) == p_str: 
-            return 
         
+        # 1. Price Change Filter
+        if last_price_cache.get(incoming_symbol) == p_str: return 
         last_price_cache[incoming_symbol] = p_str
+        
         now = datetime.datetime.now().strftime("%H:%M:%S")
+        updates = {}
         
-        # Seedha 'forex_watchlist' node ko hit karo
-        ref = db.reference('forex_watchlist')
-        all_nodes = ref.get()
-        
-        if all_nodes:
-            updates = {}
-            for node_key, data in all_nodes.items():
-                # Node key parse (e.g., BTCUSDT_uid)
-                raw_name = node_key.split('_')[0].upper()
-                
-                # Multiplier Logic
-                multiplier = 1000.0 if raw_name.startswith("1000") else 1.0
-                clean_name = raw_name.replace("1000", "")
-                
-                # Smart Match: Agar Bybit se ETHUSDT aaya aur Firebase mein ETH hai
-                if clean_name == incoming_symbol or f"{clean_name}USDT" == incoming_symbol or incoming_symbol.startswith(clean_name):
-                    final_p = float(price) * multiplier
-                    
-                    # Firebase Overwrite Logic (Sirf price aur utime badlega)
-                    updates[f"{node_key}/price"] = f"{final_p:.8f}".rstrip('0').rstrip('.')
-                    updates[f"{node_key}/utime"] = now
+        # 2. Local watchlist data se match karo (Fast Performance)
+        for node_key, data in watchlist_data.items():
+            raw_name = node_key.split('_')[0].upper()
+            multiplier = 1000.0 if raw_name.startswith("1000") else 1.0
+            clean_name = raw_name.replace("1000", "")
             
-            if updates:
-                ref.update(updates) # Sab kuch ek saath push
-                print(f"📡 forex_watchlist updated: {incoming_symbol} -> {price}")
-                del updates
+            if clean_name == incoming_symbol or f"{clean_name}USDT" == incoming_symbol or incoming_symbol.startswith(clean_name):
+                final_p = float(price) * multiplier
+                updates[f"forex_watchlist/{node_key}/price"] = f"{final_p:.8f}".rstrip('0').rstrip('.')
+                updates[f"forex_watchlist/{node_key}/utime"] = now
+        
+        if updates:
+            db.reference().update(updates) # Multi-path update
+            print(f"📡 {incoming_symbol} -> {price}")
+            
     except Exception as e:
-        print(f"⚠️ FB Update Error: {e}")
+        print(f"⚠️ Update Error: {e}")
 
-# --- 3. STABLE WEBSOCKET HANDLERS ---
+# --- 4. WEBSOCKET HANDLERS ---
 def on_message(ws, message):
     try:
         msg = json.loads(message)
@@ -68,15 +73,14 @@ def on_message(ws, message):
             ticks = data if isinstance(data, list) else [data]
             for tick in ticks:
                 s, p = tick.get('symbol'), tick.get('lastPrice')
-                if s and p: 
-                    update_firebase(s, p)
+                if s and p: update_firebase(s, p)
     except: pass
 
 def run_ws_engine():
     global ws_app, already_subscribed
     while True:
         try:
-            print("🚀 Starting Bybit V5 Engine...")
+            print("🚀 Connecting to Bybit V5...")
             already_subscribed.clear()
             ws_app = websocket.WebSocketApp(
                 "wss://stream.bybit.com/v5/public/linear",
@@ -84,49 +88,39 @@ def run_ws_engine():
                 on_error=lambda w, e: print(f"⚠️ WS Error: {e}"),
                 on_close=lambda w, c, r: print("🔌 Connection Lost. Reconnecting...")
             )
+            # 20s Ping interval connection ko stable rakhega
             ws_app.run_forever(ping_interval=20, ping_timeout=10)
         except: pass
         time.sleep(5)
 
-# --- 4. SYNC LOOP (Watchlist Scanning) ---
-def sync_watchlist():
-    while True:
-        try:
-            # 1. Firebase se watchlist node scan karo
-            watchlist_ref = db.reference('forex_watchlist')
-            watchlist = watchlist_ref.get()
-            
-            if watchlist and ws_app and ws_app.sock and ws_app.sock.connected:
-                to_sub = []
-                for node_key in watchlist.keys():
-                    # Symbol extraction
-                    s = node_key.split('_')[0].upper().replace("1000", "")
-                    if not s.endswith("USDT"): s += "USDT" 
-                    
-                    # 2. Duplicate Check: Dobara subscribe nahi karna
-                    if s not in already_subscribed:
-                        to_sub.append(s)
-                
-                if to_sub:
-                    # 3. Batch Subscription (100 symbols per batch)
-                    for i in range(0, len(to_sub), 100):
-                        batch = to_sub[i:i+100]
-                        ws_app.send(json.dumps({"op": "subscribe", "args": [f"tickers.{x}" for x in batch]}))
-                        for x in batch: already_subscribed.add(x)
-                        print(f"✅ Subscribed to new symbols in forex_watchlist: {batch}")
-            
-            eventlet.sleep(15) 
-        except Exception as e:
-            print(f"⚠️ Sync Error: {e}")
-            eventlet.sleep(10)
+# --- 5. SYNC LOGIC ---
+def sync_now():
+    global already_subscribed, ws_app, watchlist_data
+    if not ws_app or not ws_app.sock or not ws_app.sock.connected: return
+    
+    to_sub = []
+    for node_key in watchlist_data.keys():
+        s = node_key.split('_')[0].upper().replace("1000", "")
+        if not s.endswith("USDT"): s += "USDT"
+        if s not in already_subscribed:
+            to_sub.append(s)
+    
+    if to_sub:
+        for i in range(0, len(to_sub), 100):
+            batch = to_sub[i:i+100]
+            ws_app.send(json.dumps({"op": "subscribe", "args": [f"tickers.{x}" for x in batch]}))
+            for x in batch: already_subscribed.add(x)
+            print(f"✅ Subscribed: {batch}")
 
 def application(env, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
-    return [b"FOREX WATCHLIST ENGINE IS STABLE"]
+    return [b"ENGINE IS STABLE"]
 
 if __name__ == '__main__':
     from eventlet import wsgi
+    # Start Listener and Engines
+    eventlet.spawn(start_watchlist_listener)
     eventlet.spawn(run_ws_engine)
-    eventlet.spawn(sync_watchlist)
+    
     port = int(os.environ.get("PORT", 10000))
     wsgi.server(eventlet.listen(('0.0.0.0', port)), application)
