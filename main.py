@@ -14,68 +14,66 @@ if not firebase_admin._apps:
     })
 print("✅ Firebase Connected!")
 
-# --- 2. ENGINE (Unique Subscriptions & 1s Updates) ---
+# --- 2. FAST ENGINE (1000+ Symbols Logic) ---
 def start_sync():
-    print("🚀 Fast Engine Started (1-second updates)...")
+    print("🚀 Massive Engine Active: Handling 1000+ Unique Symbols...")
     
     while True:
         try:
-            # Poore database ka snapshot lena
-            root_data = db.reference('/').get()
-            if not root_data:
+            # 1. Firebase se poora data ek baar mein fetch karna
+            ref = db.reference('forex_watchlist')
+            watchlist = ref.get()
+            
+            if not watchlist:
+                print("⚠️ Waiting for user to add symbols from APK...")
                 eventlet.sleep(5)
                 continue
 
-            # Sabhi watchlist nodes ko check karna (Forex, Indian, etc.)
-            watchlist_nodes = ['forex_watchlist', 'watchlist', 'indian_market'] # Apne nodes ke naam yahan add karein
+            # 2. Duplicate Token Filter (Unique Symbols Only)
+            # Agar 1000 nodes mein same 'BTCUSDT' hai, toh set() usey 1 bana dega
+            unique_symbols = set()
+            for node_key in watchlist.keys():
+                symbol = node_key.split('_')[0].upper()
+                unique_symbols.add(symbol)
+
+            # 3. Batch Price Fetching (Binance se sabka price ek saath)
+            # Binance 1 call mein multiple prices de sakta hai
+            price_map = {}
+            try:
+                # Sabhi unique symbols ka current price lena
+                res = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=5).json()
+                for item in res:
+                    if item['symbol'] in unique_symbols:
+                        price_map[item['symbol']] = item['price']
+            except Exception as api_err:
+                print(f"❌ API Error: {api_err}")
+
+            # 4. Database Update (Har node ko price dena)
+            now = datetime.datetime.now().strftime("%H:%M:%S")
+            updates = {}
             
-            for node_name in watchlist_nodes:
-                items = root_data.get(node_name, {})
-                if not items:
-                    continue
+            for node_key in watchlist.keys():
+                symbol = node_key.split('_')[0].upper()
+                if symbol in price_map:
+                    # Batch update ke liye dictionary taiyaar karna
+                    updates[f"{node_key}/price"] = float(price_map[symbol])
+                    updates[f"{node_key}/utime"] = now
+            
+            # Ek hi baar mein saare 1000 symbols update karna
+            if updates:
+                ref.update(updates)
+                print(f"⚡ Batch Updated {len(updates)} nodes for {len(unique_symbols)} unique symbols at {now}")
 
-                # --- UNIQUE SUBSCRIPTION LOGIC ---
-                # 'seen_symbols' set duplicate symbols ko rokega
-                seen_symbols = set()
-                
-                for node_key, details in items.items():
-                    # Symbol nikalna (e.g., BTCUSDT_abc -> BTCUSDT)
-                    symbol = node_key.split('_')[0].upper()
-                    
-                    # Agar ye symbol is loop mein pehle hi update ho chuka hai, toh skip karo
-                    if symbol in seen_symbols:
-                        continue
-                    
-                    # Binance API for 1-second price
-                    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-                    res = requests.get(url, timeout=1).json()
-                    
-                    if 'price' in res:
-                        price_val = float(res['price'])
-                        p_str = "{:.2f}".format(price_val) if price_val > 1 else "{:.6f}".format(price_val)
-                        ts = datetime.datetime.now().strftime("%H:%M:%S")
-
-                        # Database Update
-                        db.reference(f'{node_name}/{node_key}').update({
-                            "price": float(p_str),
-                            "utime": ts
-                        })
-                        
-                        # Is symbol ko 'seen' mark kar dena taaki dobara subscribe na ho
-                        seen_symbols.add(symbol)
-                        print(f"⚡ {node_name} | {symbol}: {p_str}")
-
-            # 1-second delay for ultra-fast updates
-            eventlet.sleep(1)
+            eventlet.sleep(1) # 1 Second Speed
             
         except Exception as e:
-            print(f"⚠️ Sync Error: {e}")
+            print(f"⚠️ Global Engine Error: {e}")
             eventlet.sleep(2)
 
-# --- 3. WEB SERVER ---
+# --- 3. RENDER SERVER ---
 def application(env, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
-    return [b"1s Fast Engine is Running. Duplicate Filter Active."]
+    return [b"Massive Sync Engine is LIVE. Handling 1000+ Symbols."]
 
 if __name__ == '__main__':
     eventlet.spawn(start_sync)
