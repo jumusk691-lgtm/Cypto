@@ -14,12 +14,12 @@ if not firebase_admin._apps:
     })
 print("✅ Firebase Connected!")
 
-# --- 2. GLOBAL CONTROLS ---
+# Global Controls
 already_subscribed = set()
 last_price_cache = {}
 ws_app = None
 
-# --- 3. SMART UPDATE LOGIC ---
+# --- 2. UPDATE LOGIC ---
 def update_firebase(symbol, price):
     global last_price_cache
     try:
@@ -46,13 +46,13 @@ def update_firebase(symbol, price):
             
             if updates:
                 ref.update(updates)
-                print(f"📡 {symbol} Updated -> {price}")
+                print(f"📡 {symbol} -> {price}")
                 del updates
                 
     except Exception as e:
-        print(f"⚠️ Firebase Update Error: {e}")
+        print(f"⚠️ FB Error: {e}")
 
-# --- 4. BATCHED SUBSCRIPTION ---
+# --- 3. BATCHED SUBSCRIPTION ---
 def manage_subscriptions(current_list):
     global already_subscribed, ws_app
     new_to_add = [s for s in current_list if s not in already_subscribed]
@@ -68,7 +68,7 @@ def manage_subscriptions(current_list):
         print(f"✅ Batch Subscribed: {len(batch)} symbols")
         eventlet.sleep(0.3)
 
-# --- 5. WEBSOCKET ENGINE ---
+# --- 4. WEBSOCKET ENGINE (STABLE) ---
 def on_message(ws, message):
     data = json.loads(message)
     if 'data' in data:
@@ -85,41 +85,36 @@ def run_ws_engine():
             ws_app = websocket.WebSocketApp(
                 "wss://stream.bybit.com/v5/public/linear",
                 on_message=on_message,
-                on_error=lambda w, e: print(f"⚠️ WS Error: {e}"),
-                on_close=lambda w, c, r: print("🔌 Connection Lost.")
+                on_close=lambda w, c, r: print("🔌 Connection Lost. Reconnecting...")
             )
-            ws_app.run_forever()
+            # FIX: Adding Ping to keep connection alive
+            ws_app.run_forever(ping_interval=20, ping_timeout=10)
         except: pass
         time.sleep(5)
 
-# --- 6. WATCHLIST SYNC ---
+# --- 5. SYNC LOOP ---
 def sync_watchlist():
     while True:
         try:
             watchlist = db.reference('forex_watchlist').get()
             if watchlist:
-                symbols = []
-                for node_key in watchlist.keys():
-                    s = node_key.split('_')[0].upper()
-                    if not s.endswith("USDT"): s += "USDT"
-                    symbols.append(s)
+                symbols = [node_key.split('_')[0].upper() for node_key in watchlist.keys()]
+                # Ensure USDT suffix for Bybit
+                symbols = [s if s.endswith("USDT") else s + "USDT" for s in symbols]
                 manage_subscriptions(symbols)
             eventlet.sleep(30)
         except Exception as e:
-            print(f"⚠️ Sync Loop Error: {e}")
+            print(f"⚠️ Sync Error: {e}")
             eventlet.sleep(10)
 
-# --- 7. RENDER HEALTH CHECK FIX ---
+# --- 6. HEALTH CHECK ---
 def application(env, start_response):
-    status = '200 OK'
-    headers = [('Content-Type', 'text/plain')]
-    start_response(status, headers)
-    return [b"STABLE"]  # List format for WSGI compatibility
+    start_response('200 OK', [('Content-Type', 'text/plain')])
+    return [b"STABLE"]
 
 if __name__ == '__main__':
     from eventlet import wsgi
     eventlet.spawn(run_ws_engine)
     eventlet.spawn(sync_watchlist)
     port = int(os.environ.get("PORT", 10000))
-    # Correct WSGI server call
     wsgi.server(eventlet.listen(('0.0.0.0', port)), application)
