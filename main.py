@@ -12,43 +12,54 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
 print("✅ Firebase Connected!")
 
+# Global States
 already_subscribed = set()
 last_price_cache = {}
 ws_app = None
 
-# --- 2. IMPROVED MATCHING LOGIC ---
+# --- 2. THE ULTIMATE MATCHING ENGINE ---
 def update_firebase(incoming_symbol, price):
     global last_price_cache
     try:
         if not price or float(price) <= 0: return
+        
+        # Price Change Filter: Sirf badla hua price hi bhejna hai
         p_str = str(price)
-        if last_price_cache.get(incoming_symbol) == p_str: return 
+        if last_price_cache.get(incoming_symbol) == p_str: 
+            return 
         
         last_price_cache[incoming_symbol] = p_str
         now = datetime.datetime.now().strftime("%H:%M:%S")
+        
         ref = db.reference('forex_watchlist')
         all_nodes = ref.get()
         
         if all_nodes:
             updates = {}
             for node_key, data in all_nodes.items():
-                # Extract clean symbol from Firebase (ETHUSDT_uid -> ETHUSDT)
+                # Extract clean name (e.g., ETH_uid -> ETH)
                 raw_name = node_key.split('_')[0].upper()
                 
-                # Multiplier Support
+                # Multiplier (1000LUNC etc)
                 multiplier = 1000.0 if raw_name.startswith("1000") else 1.0
                 clean_name = raw_name.replace("1000", "")
                 
-                # MATCHING: ETH vs ETHUSDT or XAU vs XAUUSDT
-                # Bybit sends: ETHUSDT. We check if ETH is in ETHUSDT.
-                if clean_name == incoming_symbol or f"{clean_name}USDT" == incoming_symbol or incoming_symbol.startswith(clean_name):
+                # FLEXIBLE MATCHING LOGIC
+                # Agar market bhej raha ETHUSDT aur Firebase mein hai ETH ya ETHUSDT
+                is_match = (clean_name == incoming_symbol or 
+                           f"{clean_name}USDT" == incoming_symbol or 
+                           incoming_symbol.replace("USDT", "") == clean_name)
+                
+                if is_match:
                     final_p = float(price) * multiplier
+                    # Overwrite fields
                     updates[f"{node_key}/price"] = f"{final_p:.8f}".rstrip('0').rstrip('.')
                     updates[f"{node_key}/utime"] = now
             
             if updates:
-                ref.update(updates)
-                print(f"📡 Updated: {incoming_symbol} -> {price}")
+                ref.update(updates) # Firebase write
+                print(f"📡 {incoming_symbol} -> {price} (Updated {len(updates)//2} Nodes)")
+                del updates
     except Exception as e:
         print(f"⚠️ Logic Error: {e}")
 
@@ -56,24 +67,21 @@ def update_firebase(incoming_symbol, price):
 def on_message(ws, message):
     try:
         msg = json.loads(message)
-        # Bybit V5 structure: msg['data'] contains 'symbol' and 'lastPrice'
         if 'data' in msg:
             data = msg['data']
-            # Sometimes data is a list, sometimes a dict
-            if isinstance(data, list):
-                for item in data:
-                    s, p = item.get('symbol'), item.get('lastPrice')
-                    if s and p: update_firebase(s, p)
-            else:
-                s, p = data.get('symbol'), data.get('lastPrice')
-                if s and p: update_firebase(s, p)
+            # Bybit data can be list or dict
+            ticks = data if isinstance(data, list) else [data]
+            for tick in ticks:
+                s, p = tick.get('symbol'), tick.get('lastPrice')
+                if s and p: 
+                    update_firebase(s, p)
     except: pass
 
 def run_ws_engine():
     global ws_app, already_subscribed
     while True:
         try:
-            print("🚀 Engine Restarting...")
+            print("🚀 Starting Bybit V5 Engine...")
             already_subscribed.clear()
             ws_app = websocket.WebSocketApp(
                 "wss://stream.bybit.com/v5/public/linear",
@@ -81,31 +89,32 @@ def run_ws_engine():
                 on_error=lambda w, e: print(f"⚠️ WS Error: {e}"),
                 on_close=lambda w, c, r: print("🔌 Connection Lost.")
             )
+            # Keeping connection alive with Pings
             ws_app.run_forever(ping_interval=20, ping_timeout=10)
         except: pass
         time.sleep(5)
 
-# --- 4. SYNC WATCHLIST ---
+# --- 4. SYNC LOOP ---
 def sync_watchlist():
     while True:
         try:
             watchlist = db.reference('forex_watchlist').get()
             if watchlist and ws_app and ws_app.sock and ws_app.sock.connected:
-                symbols_to_sub = []
+                to_sub = []
                 for node_key in watchlist.keys():
                     s = node_key.split('_')[0].upper().replace("1000", "")
-                    if not s.endswith("USDT") and s not in ["BTCUSDT", "ETHUSDT"]: 
-                        s += "USDT"
+                    if not s.endswith("USDT"): s += "USDT" # Force Bybit Format
+                    
                     if s not in already_subscribed:
-                        symbols_to_sub.append(s)
+                        to_sub.append(s)
                 
-                if symbols_to_sub:
-                    # Subscribe to tickers topic
-                    sub_msg = {"op": "subscribe", "args": [f"tickers.{sym}" for sym in symbols_to_sub]}
-                    ws_app.send(json.dumps(sub_msg))
-                    for sym in symbols_to_sub: already_subscribed.add(sym)
-                    print(f"✅ Subscribed to: {symbols_to_sub}")
-            eventlet.sleep(20)
+                if to_sub:
+                    # Bybit V5 Subscription
+                    ws_app.send(json.dumps({"op": "subscribe", "args": [f"tickers.{x}" for x in to_sub]}))
+                    for x in to_sub: already_subscribed.add(x)
+                    print(f"✅ New Subscriptions: {to_sub}")
+            
+            eventlet.sleep(15) # Check for new symbols every 15s
         except: eventlet.sleep(10)
 
 def application(env, start_response):
