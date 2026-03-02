@@ -32,7 +32,7 @@ def start_sync():
                 continue
 
             # Nodes jahan symbols ho sakte hain
-            target_nodes = ['forex_watchlist', 'central_watchlist']
+            target_nodes = ['forex_watchlist']
             
             # Sabhi unique symbols ki list banana
             for node in target_nodes:
