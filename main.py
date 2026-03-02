@@ -35,9 +35,7 @@ def update_firebase(symbol, price):
         if all_nodes:
             updates = {}
             for node_key, data in all_nodes.items():
-                # Aapki key format (ETHUSDT_uid) ke liye logic
                 clean_name = node_key.split('_')[0].upper()
-                
                 multiplier = 1000.0 if clean_name.startswith("1000") else 1.0
                 search_target = clean_name.replace("1000", "") if multiplier > 1.0 else clean_name
                 
@@ -111,9 +109,17 @@ def sync_watchlist():
             print(f"⚠️ Sync Loop Error: {e}")
             eventlet.sleep(10)
 
+# --- 7. RENDER HEALTH CHECK FIX ---
+def application(env, start_response):
+    status = '200 OK'
+    headers = [('Content-Type', 'text/plain')]
+    start_response(status, headers)
+    return [b"STABLE"]  # List format for WSGI compatibility
+
 if __name__ == '__main__':
     from eventlet import wsgi
     eventlet.spawn(run_ws_engine)
     eventlet.spawn(sync_watchlist)
     port = int(os.environ.get("PORT", 10000))
-    wsgi.server(eventlet.listen(('0.0.0.0', port)), lambda e, s: [s('200 OK', [('Content-Type', 'text/plain')]), b"STABLE"])
+    # Correct WSGI server call
+    wsgi.server(eventlet.listen(('0.0.0.0', port)), application)
