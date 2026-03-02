@@ -14,21 +14,23 @@ if not firebase_admin._apps:
     })
 print("✅ Firebase Connected!")
 
-# --- 2. SMART PARSER (Format & Meme Token Logic) ---
+# --- 2. PURANA LOGIC: SMART PARSER (Format & Meme Token) ---
 def parse_symbol(raw_key):
-    # Har symbol ko unique aur clean rakhta hai
     full_sym = raw_key.split('_')[0].upper()
     clean = full_sym.replace("1000", "").replace("USDT", "")
-    clean = re.sub(r'\d+', '', clean)
+    clean = re.sub(r'[^A-Z]', '', clean) # Sirf alphabets bacha raha hai (Pro Level)
     return clean, full_sym
 
-# --- 3. HIGH-SPEED CLEAN ENGINE (Storage Saver) ---
+# --- 3. MASTER ENGINE (Smart Memory + Storage Saver Mix) ---
 def start_sync():
-    print("🚀 Clean-Storage Engine Active: Overwriting history every second...")
+    print("🚀 Smart-Clean Engine Active: One-time Subscribe + Auto-Overwrite...")
     
+    # NAYA LOGIC: Cache taaki baar-baar subscribe na ho
+    subscribed_cache = {} 
+
     while True:
         try:
-            # Step 1: Current data snapshot (Fastest way)
+            # Step 1: Watchlist fetch karna
             ref = db.reference('forex_watchlist')
             watchlist = ref.get()
             
@@ -36,51 +38,71 @@ def start_sync():
                 eventlet.sleep(5)
                 continue
 
-            # Step 2: Unique Symbol Mapping
-            clean_to_full = {parse_symbol(k)[0]: None for k in watchlist.keys()}
-
-            # Step 3: Fast API Call (1-Second Data)
-            sym_list = ",".join(clean_to_full.keys())
-            url = f"https://min-api.cryptocompare.com/data/pricemulti?fsyms={sym_list}&tsyms=USD"
-            res = requests.get(url, timeout=3).json()
+            # NAYA LOGIC: Check for New/Deleted symbols
+            current_keys = set(watchlist.keys())
+            cached_keys = set(subscribed_cache.keys())
             
+            new_keys = current_keys - cached_keys
+            deleted_keys = cached_keys - current_keys
+
+            # Naya symbol aaya toh hi subscribe (parse) hoga
+            if new_keys:
+                print(f"🆕 Subscribing {len(new_keys)} New Symbols...")
+                for k in new_keys:
+                    clean, full = parse_symbol(k)
+                    subscribed_cache[k] = {"clean": clean, "full": full}
+
+            # Purana delete hua toh cache se saaf
+            if deleted_keys:
+                for k in deleted_keys:
+                    subscribed_cache.pop(k, None)
+
+            # Step 2: FAST API CALL (Tukdon mein taaki 1000+ handle ho ske)
+            all_clean_names = list(set(info["clean"] for info in subscribed_cache.values()))
+            all_prices = {}
+            
+            for i in range(0, len(all_clean_names), 80):
+                chunk = ",".join(all_clean_names[i:i+80])
+                url = f"https://min-api.cryptocompare.com/data/pricemulti?fsyms={chunk}&tsyms=USD"
+                res = requests.get(url, timeout=5).json()
+                if isinstance(res, dict) and "Response" not in res:
+                    for c_sym, p_data in res.items():
+                        all_prices[c_sym] = p_data['USD']
+
+            # Step 3: PURANA LOGIC: OVERWRITE (Storage Saver)
             now = datetime.datetime.now().strftime("%H:%M:%S")
             updates = {}
-            count = 0
-
-            # Step 4: OVERWRITE LOGIC (Storage & Log Saving)
-            for node_key in watchlist.keys():
-                clean_name, full_name = parse_symbol(node_key)
+            
+            for node_key, info in subscribed_cache.items():
+                c_name = info["clean"]
+                f_name = info["full"]
                 
-                if clean_name in res:
-                    price_val = float(res[clean_name]['USD'])
+                if c_name in all_prices:
+                    price_val = float(all_prices[c_name])
                     
-                    # 1000x Meme Token Multiplier
-                    if "1000" in full_name:
+                    # 1000x Multiplier (Meme Token Logic)
+                    if "1000" in f_name:
                         price_val = price_val * 1000
                     
-                    # Yahan pichla data automatically clean (overwrite) ho raha hai
+                    # DATABASE CLEANING: Pichla data mita kar naya overwrite
                     updates[f"{node_key}/price"] = price_val
                     updates[f"{node_key}/utime"] = now
-                    count += 1
 
             if updates:
-                # 'update' command purani values ko mita kar naya likhti hai (Zero storage growth)
                 ref.update(updates)
-                # Render Logs Cleaning: Sirf ek line summary taaki storage bache
-                print(f"🔄 [{now}] DB Cleaned & Synced: {count} symbols live.")
+                # RENDER CLEAN LOGS: Sirf ek line summary
+                print(f"🔄 [{now}] DB Overwritten & Synced: {len(subscribed_cache)} symbols live.")
 
             eventlet.sleep(1) # Strict 1-Second Gap
             
         except Exception as e:
-            # Error log ko chhota rakho taaki Render memory na bhare
             print(f"⚠️ Status: {str(e)[:40]}")
             eventlet.sleep(2)
 
 # --- 4. SERVER SETUP ---
 def application(env, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
-    return [b"STORAGE-SAVER ENGINE IS LIVE. DATABASE CLEANED EVERY SECOND."]
+    return [b"SMART-CLEAN PRO ENGINE IS LIVE."]
 
 if __name__ == '__main__':
     from eventlet import wsgi
