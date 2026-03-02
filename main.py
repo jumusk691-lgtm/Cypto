@@ -14,66 +14,76 @@ if not firebase_admin._apps:
     })
 print("✅ Firebase Connected!")
 
-# --- 2. FAST ENGINE (1000+ Symbols Logic) ---
+# --- 2. THE ENGINE (Handles 1000+ Symbols & Errors) ---
 def start_sync():
-    print("🚀 Massive Engine Active: Handling 1000+ Unique Symbols...")
+    print("🚀 Massive Engine Active: Optimizing for 1000+ Unique Symbols...")
     
     while True:
         try:
-            # 1. Firebase se poora data ek baar mein fetch karna
-            ref = db.reference('forex_watchlist')
-            watchlist = ref.get()
+            # 1. Firebase Scan (Donon watchlists)
+            updates = {}
+            now = datetime.datetime.now().strftime("%H:%M:%S")
+            unique_symbols = set()
             
-            if not watchlist:
-                print("⚠️ Waiting for user to add symbols from APK...")
+            # Hum saara data ek saath fetch karte hain taaki speed mile
+            db_root = db.reference('/').get()
+            if not db_root:
                 eventlet.sleep(5)
                 continue
 
-            # 2. Duplicate Token Filter (Unique Symbols Only)
-            # Agar 1000 nodes mein same 'BTCUSDT' hai, toh set() usey 1 bana dega
-            unique_symbols = set()
-            for node_key in watchlist.keys():
-                symbol = node_key.split('_')[0].upper()
-                unique_symbols.add(symbol)
+            # Nodes jahan symbols ho sakte hain
+            target_nodes = ['forex_watchlist', 'central_watchlist']
+            
+            # Sabhi unique symbols ki list banana
+            for node in target_nodes:
+                data = db_root.get(node, {})
+                for key in data.keys():
+                    sym = key.split('_')[0].upper()
+                    unique_symbols.add(sym)
 
-            # 3. Batch Price Fetching (Binance se sabka price ek saath)
-            # Binance 1 call mein multiple prices de sakta hai
-            price_map = {}
+            if not unique_symbols:
+                eventlet.sleep(5)
+                continue
+
+            # 2. Binance API - Har symbol ka price ek saath (Batch)
             try:
-                # Sabhi unique symbols ka current price lena
-                res = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=5).json()
-                for item in res:
-                    if item['symbol'] in unique_symbols:
-                        price_map[item['symbol']] = item['price']
-            except Exception as api_err:
-                print(f"❌ API Error: {api_err}")
+                res = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=5)
+                if res.status_code == 200:
+                    prices = res.json()
+                    # Check if prices is a list (Expected Binance format)
+                    if isinstance(prices, list):
+                        price_map = {item['symbol']: item['price'] for item in prices if item['symbol'] in unique_symbols}
+                        
+                        # 3. Update Map Taiyaar Karna
+                        for node in target_nodes:
+                            node_data = db_root.get(node, {})
+                            for key in node_data.keys():
+                                sym = key.split('_')[0].upper()
+                                if sym in price_map:
+                                    updates[f"{node}/{key}/price"] = float(price_map[sym])
+                                    updates[f"{node}/{key}/utime"] = now
+                        
+                        # 4. Multi-Path Update (Single Shot for 1000 nodes)
+                        if updates:
+                            db.reference('/').update(updates)
+                            print(f"⚡ {len(updates)} nodes updated at {now} (Unique: {len(unique_symbols)})")
+                    else:
+                        print("⚠️ Binance sent unexpected response format.")
+                else:
+                    print(f"⚠️ Binance API Down. Status: {res.status_code}")
+            except Exception as api_e:
+                print(f"❌ API Loop Error: {api_e}")
 
-            # 4. Database Update (Har node ko price dena)
-            now = datetime.datetime.now().strftime("%H:%M:%S")
-            updates = {}
-            
-            for node_key in watchlist.keys():
-                symbol = node_key.split('_')[0].upper()
-                if symbol in price_map:
-                    # Batch update ke liye dictionary taiyaar karna
-                    updates[f"{node_key}/price"] = float(price_map[symbol])
-                    updates[f"{node_key}/utime"] = now
-            
-            # Ek hi baar mein saare 1000 symbols update karna
-            if updates:
-                ref.update(updates)
-                print(f"⚡ Batch Updated {len(updates)} nodes for {len(unique_symbols)} unique symbols at {now}")
-
-            eventlet.sleep(1) # 1 Second Speed
+            eventlet.sleep(1) # 1 Second update frequency
             
         except Exception as e:
             print(f"⚠️ Global Engine Error: {e}")
-            eventlet.sleep(2)
+            eventlet.sleep(5)
 
 # --- 3. RENDER SERVER ---
 def application(env, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
-    return [b"Massive Sync Engine is LIVE. Handling 1000+ Symbols."]
+    return [b"Massive Sync Engine is RUNNING. Security & Scaling Active."]
 
 if __name__ == '__main__':
     eventlet.spawn(start_sync)
