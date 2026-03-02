@@ -10,9 +10,8 @@ KEY_PATH = os.path.join("/etc/secrets/", KEY_FILE) if os.path.exists("/etc/secre
 if not firebase_admin._apps:
     cred = credentials.Certificate(KEY_PATH)
     firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
-print("✅ Firebase Connected!")
+print("✅ Firebase Connected to forex_watchlist engine!")
 
-# Global States
 already_subscribed = set()
 last_price_cache = {}
 ws_app = None
@@ -23,7 +22,7 @@ def update_firebase(incoming_symbol, price):
     try:
         if not price or float(price) <= 0: return
         
-        # Price Change Filter: Sirf badla hua price hi bhejna hai
+        # Filtering: Agar price wahi hai jo cache mein hai, toh aage mat badho
         p_str = str(price)
         if last_price_cache.get(incoming_symbol) == p_str: 
             return 
@@ -31,37 +30,34 @@ def update_firebase(incoming_symbol, price):
         last_price_cache[incoming_symbol] = p_str
         now = datetime.datetime.now().strftime("%H:%M:%S")
         
+        # Seedha 'forex_watchlist' node ko hit karo
         ref = db.reference('forex_watchlist')
         all_nodes = ref.get()
         
         if all_nodes:
             updates = {}
             for node_key, data in all_nodes.items():
-                # Extract clean name (e.g., ETH_uid -> ETH)
+                # Node key parse (e.g., BTCUSDT_uid)
                 raw_name = node_key.split('_')[0].upper()
                 
-                # Multiplier (1000LUNC etc)
+                # Multiplier Logic
                 multiplier = 1000.0 if raw_name.startswith("1000") else 1.0
                 clean_name = raw_name.replace("1000", "")
                 
-                # FLEXIBLE MATCHING LOGIC
-                # Agar market bhej raha ETHUSDT aur Firebase mein hai ETH ya ETHUSDT
-                is_match = (clean_name == incoming_symbol or 
-                           f"{clean_name}USDT" == incoming_symbol or 
-                           incoming_symbol.replace("USDT", "") == clean_name)
-                
-                if is_match:
+                # Smart Match: Agar Bybit se ETHUSDT aaya aur Firebase mein ETH hai
+                if clean_name == incoming_symbol or f"{clean_name}USDT" == incoming_symbol or incoming_symbol.startswith(clean_name):
                     final_p = float(price) * multiplier
-                    # Overwrite fields
+                    
+                    # Firebase Overwrite Logic (Sirf price aur utime badlega)
                     updates[f"{node_key}/price"] = f"{final_p:.8f}".rstrip('0').rstrip('.')
                     updates[f"{node_key}/utime"] = now
             
             if updates:
-                ref.update(updates) # Firebase write
-                print(f"📡 {incoming_symbol} -> {price} (Updated {len(updates)//2} Nodes)")
+                ref.update(updates) # Sab kuch ek saath push
+                print(f"📡 forex_watchlist updated: {incoming_symbol} -> {price}")
                 del updates
     except Exception as e:
-        print(f"⚠️ Logic Error: {e}")
+        print(f"⚠️ FB Update Error: {e}")
 
 # --- 3. STABLE WEBSOCKET HANDLERS ---
 def on_message(ws, message):
@@ -69,7 +65,6 @@ def on_message(ws, message):
         msg = json.loads(message)
         if 'data' in msg:
             data = msg['data']
-            # Bybit data can be list or dict
             ticks = data if isinstance(data, list) else [data]
             for tick in ticks:
                 s, p = tick.get('symbol'), tick.get('lastPrice')
@@ -87,42 +82,51 @@ def run_ws_engine():
                 "wss://stream.bybit.com/v5/public/linear",
                 on_message=on_message,
                 on_error=lambda w, e: print(f"⚠️ WS Error: {e}"),
-                on_close=lambda w, c, r: print("🔌 Connection Lost.")
+                on_close=lambda w, c, r: print("🔌 Connection Lost. Reconnecting...")
             )
-            # Keeping connection alive with Pings
             ws_app.run_forever(ping_interval=20, ping_timeout=10)
         except: pass
         time.sleep(5)
 
-# --- 4. SYNC LOOP ---
+# --- 4. SYNC LOOP (Watchlist Scanning) ---
 def sync_watchlist():
     while True:
         try:
-            watchlist = db.reference('forex_watchlist').get()
+            # 1. Firebase se watchlist node scan karo
+            watchlist_ref = db.reference('forex_watchlist')
+            watchlist = watchlist_ref.get()
+            
             if watchlist and ws_app and ws_app.sock and ws_app.sock.connected:
                 to_sub = []
                 for node_key in watchlist.keys():
+                    # Symbol extraction
                     s = node_key.split('_')[0].upper().replace("1000", "")
-                    if not s.endswith("USDT"): s += "USDT" # Force Bybit Format
+                    if not s.endswith("USDT"): s += "USDT" 
                     
+                    # 2. Duplicate Check: Dobara subscribe nahi karna
                     if s not in already_subscribed:
                         to_sub.append(s)
                 
                 if to_sub:
-                    # Bybit V5 Subscription
-                    ws_app.send(json.dumps({"op": "subscribe", "args": [f"tickers.{x}" for x in to_sub]}))
-                    for x in to_sub: already_subscribed.add(x)
-                    print(f"✅ New Subscriptions: {to_sub}")
+                    # 3. Batch Subscription (100 symbols per batch)
+                    for i in range(0, len(to_sub), 100):
+                        batch = to_sub[i:i+100]
+                        ws_app.send(json.dumps({"op": "subscribe", "args": [f"tickers.{x}" for x in batch]}))
+                        for x in batch: already_subscribed.add(x)
+                        print(f"✅ Subscribed to new symbols in forex_watchlist: {batch}")
             
-            eventlet.sleep(15) # Check for new symbols every 15s
-        except: eventlet.sleep(10)
+            eventlet.sleep(15) 
+        except Exception as e:
+            print(f"⚠️ Sync Error: {e}")
+            eventlet.sleep(10)
 
 def application(env, start_response):
     start_response('200 OK', [('Content-Type', 'text/plain')])
-    return [b"STABLE"]
+    return [b"FOREX WATCHLIST ENGINE IS STABLE"]
 
 if __name__ == '__main__':
     from eventlet import wsgi
     eventlet.spawn(run_ws_engine)
     eventlet.spawn(sync_watchlist)
-    wsgi.server(eventlet.listen(('0.0.0.0', int(os.environ.get("PORT", 10000)))), application)
+    port = int(os.environ.get("PORT", 10000))
+    wsgi.server(eventlet.listen(('0.0.0.0', port)), application)
