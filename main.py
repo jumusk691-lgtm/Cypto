@@ -8,81 +8,99 @@ KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 if not firebase_admin._apps:
     cred = credentials.Certificate(KEY_FILE)
     firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
-print("✅ Firebase Connected for Forex!")
 
-# --- 2. MATCHING ENGINE (सिर्फ Forex के लिए) ---
-def update_firebase(binance_symbol, price):
+# ट्रैकिंग के लिए ग्लोबल वेरिएबल्स
+subscribed_streams = set()
+last_update_time = {}
+local_watchlist_map = {}
+
+# --- 2. MATCHING & OVERWRITE LOGIC (2 SEC DELAY) ---
+def handle_instant_update(binance_symbol, price):
     try:
-        p_val = float(price)
-        # Forex के लिए 2 या 4 decimal places काफी हैं
-        p_str = "%.2f" % p_val 
-        now = datetime.datetime.now().strftime("%H:%M:%S")
+        current_time = time.time()
         
-        # 'forex_watchlist' से डेटा उठाना
-        watchlist = db.reference('forex_watchlist').get()
-        if not watchlist: return
+        # 2 सेकंड का गैप चेक करें (Duplicate avoid and throttle)
+        if binance_symbol in last_update_time:
+            if current_time - last_update_time[binance_symbol] < 2:
+                return
+
+        p_str = "%.2f" % float(price)
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        incoming_sym = binance_symbol.upper()
         
         updates = {}
-        incoming = binance_symbol.upper() # उदाहरण: "BTCUSDT"
-
-        for node_key in watchlist.keys():
-            # Check: क्या "BTCUSDT" हमारे Firebase की Key "BTCUSDT_uid" के अंदर है?
-            if incoming in node_key.upper():
+        # केवल तभी अपडेट करें जब सिम्बल हमारे लोकल मैप में हो
+        if incoming_sym in local_watchlist_map:
+            for node_key in local_watchlist_map[incoming_sym]:
                 updates[f"forex_watchlist/{node_key}/price"] = p_str
-                updates[f"forex_watchlist/{node_key}/utime"] = now
+                updates[f"forex_watchlist/{node_key}/utime"] = now_str
         
         if updates:
-            db.reference().update(updates)
-            print(f"📡 [FOREX UPDATED] {binance_symbol} -> {p_str}")
-    except Exception as e: 
-        print(f"❌ Update Error: {e}")
+            db.reference().update(updates) # Firebase Overwrite
+            last_update_time[binance_symbol] = current_time
+            # साफ़ सुथरे लॉग्स
+            print(f"⚡ [UPDATE] {binance_symbol} -> {p_str} | Logs Cleared")
 
-# --- 3. BINANCE STREAM MANAGER ---
-def run_binance():
+    except Exception:
+        pass # लॉग्स साफ़ रखने के लिए
+
+# --- 3. BINANCE SYNC & STREAM MANAGER ---
+def run_forex_engine():
+    global subscribed_streams, local_watchlist_map
     while True:
         try:
-            watchlist = db.reference('forex_watchlist').get() or {}
-            raw_keys = list(watchlist.keys())
+            # Firebase से watchlist लाना
+            data = db.reference('forex_watchlist').get() or {}
             
-            if not raw_keys:
-                print("⏳ Waiting for Forex symbols in Firebase...")
-                eventlet.sleep(10); continue
-
-            clean_symbols = []
-            for k in raw_keys:
-                # Key से सिम्बल निकालें (जैसे BTCUSDT_abc -> btcusdt)
-                sym = k.split('_')[0].lower()
+            temp_map = {}
+            new_streams_found = False
+            
+            for k in data.keys():
+                # "BTCUSDT_b02Oy..." -> "BTCUSDT"
+                base_sym = k.split('_')[0].upper()
                 
-                # यहाँ हमने 'Double USDT' वाली गलती ठीक कर दी है:
-                if not (sym.endswith("usdt") or sym.endswith("fdusd")):
-                    sym += "usdt"
+                if base_sym not in temp_map:
+                    temp_map[base_sym] = []
+                temp_map[base_sym].append(k)
                 
-                clean_symbols.append(sym)
+                # Binance फॉर्मेट चेक (btcusdt@ticker)
+                clean_name = base_sym.lower()
+                if not (clean_name.endswith("usdt") or clean_name.endswith("fdusd")):
+                    clean_name += "usdt"
+                
+                stream = f"{clean_name}@ticker"
+                if stream not in subscribed_streams:
+                    subscribed_streams.add(stream)
+                    new_streams_found = True
+            
+            local_watchlist_map = temp_map
 
-            # Unique symbols की लिस्ट बनाएँ
-            streams = [f"{s}@ticker" for s in set(clean_symbols)]
-            url = f"wss://stream.binance.com:9443/ws/{'/'.join(streams)}"
+            # अगर नया टोकन है या कनेक्शन नहीं है तो नया Socket खोलें
+            if new_streams_found or not subscribed_streams:
+                url = f"wss://stream.binance.com:9443/ws/{'/'.join(list(subscribed_streams))}"
+                
+                def on_msg(ws, msg):
+                    d = json.loads(msg)
+                    if 's' in d and 'c' in d:
+                        handle_instant_update(d['s'], d['c'])
+                
+                print(f"🚀 Engine Connected for {len(subscribed_streams)} tokens.")
+                ws = websocket.WebSocketApp(url, on_message=on_msg)
+                ws.run_forever(ping_interval=20, ping_timeout=10)
             
-            def on_msg(ws, msg):
-                d = json.loads(msg)
-                if 's' in d and 'c' in d:
-                    update_firebase(d['s'], d['c'])
-            
-            print(f"🚀 Connecting to Binance Forex: {streams}")
-            ws = websocket.WebSocketApp(url, on_message=on_msg)
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-            
+            eventlet.sleep(10) # हर 10 सेकंड में नई वाचलिस्ट चेक करें
         except Exception as e:
-            print(f"🔄 Reconnecting: {e}"); eventlet.sleep(5)
+            eventlet.sleep(5)
 
+# --- 4. RENDER SERVER ---
 if __name__ == '__main__':
-    eventlet.spawn(run_binance)
+    print("🔥 Starting Forex Overwrite Engine...")
+    eventlet.spawn(run_forex_engine)
     
-    # Render.com के लिए Web Server
     from eventlet import wsgi
     def app(env, start_res):
         start_res('200 OK', [('Content-Type', 'text/plain')])
-        return [b"FOREX_ENGINE_RUNNING"]
+        return [b"FOREX_ACTIVE"]
     
     port = int(os.environ.get("PORT", 10000))
     wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
