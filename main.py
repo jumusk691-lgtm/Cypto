@@ -19,37 +19,43 @@ last_price_cache = {}
 def storage_cleaner():
     global last_price_cache
     while True:
-        eventlet.sleep(300) # 3 second bahut kam hai, 5 min (300s) thik hai cache clear karne ke liye
+        eventlet.sleep(300) 
         last_price_cache.clear() 
 
-# --- 3. OVERWRITE ENGINE ---
+# --- 3. FLEXIBLE OVERWRITE ENGINE ---
 def update_firebase(binance_symbol, price):
     global watchlist_data, last_price_cache
     try:
-        if not price or float(price) <= 0: return
-        p_str = f"{float(price):.4f}"
+        p_val = float(price)
+        if p_val <= 0: return
         
-        # Performance: Agar price change nahi hui toh update mat karo
+        # Smart Precision: Crypto ke liye 4 decimal, baki 2
+        p_str = f"{p_val:.4f}" if p_val < 100 else f"{p_val:.22f}".split('.')[0] + f".{str(round(p_val,2)).split('.')[1]}"
+        p_str = "%.4f" % p_val # Stable approach
+        
         if last_price_cache.get(binance_symbol) == p_str: return
         last_price_cache[binance_symbol] = p_str
         
         now = datetime.datetime.now().strftime("%H:%M:%S")
         updates = {}
         
-        incoming_sym = binance_symbol.upper() # e.g., "BTCUSDT"
+        # Normalize incoming (e.g., "BTCUSDT" -> "BTC")
+        incoming_raw = binance_symbol.upper()
+        base_incoming = incoming_raw.replace("USDT", "").replace("USD", "").replace("USDS", "")
 
         for node_key in list(watchlist_data.keys()):
-            # Node key format: "BTCUSDT_UID"
-            db_raw = node_key.split('_')[0].upper()
+            # db_raw split logic: "BTC_UID" -> "BTC"
+            db_sym_full = node_key.split('_')[0].upper()
+            base_db = db_sym_full.replace("USDT", "").replace("USD", "").replace("USDS", "")
             
-            # Flexible Match: BTCUSDT == BTCUSDT or BTC == BTCUSDT (stripped)
-            if incoming_sym == db_raw or incoming_sym.replace("USDT", "") == db_raw or db_raw.replace("USD", "") == incoming_sym.replace("USDT", ""):
+            # Agar base match ho gaya (BTC == BTC) toh update karo
+            if base_incoming == base_db:
                 updates[f"forex_watchlist/{node_key}/price"] = p_str
                 updates[f"forex_watchlist/{node_key}/utime"] = now
         
         if updates:
             db.reference().update(updates)
-            print(f"📡 [LIVE] {binance_symbol} -> {p_str}")
+            print(f"📡 [MATCHED] {binance_symbol} -> {p_str}")
     except Exception as e: 
         print(f"❌ Update Error: {e}")
 
@@ -58,7 +64,6 @@ def run_binance():
     global watchlist_data
     while True:
         try:
-            # Forex aur Crypto symbols filter karein
             raw_keys = list(watchlist_data.keys())
             if not raw_keys:
                 print("⏳ Waiting for symbols in Firebase...")
@@ -67,15 +72,14 @@ def run_binance():
             clean_symbols = []
             for k in raw_keys:
                 s = k.split('_')[0].lower()
-                # Binance sirf USDT pairs support karta hai crypto ke liye
-                # Aur gold ke liye XAUUSDT (Binance format)
-                if any(x in s for x in ["btc", "eth", "bnb", "xau", "xag", "sol"]):
-                    if not s.endswith("usdt"):
-                        # Agar XAUUSD hai toh XAUUSDT banao, BTC hai toh BTCUSDT
-                        s = s.replace("usd", "") + "usdt"
+                # Mapping symbols to Binance pairs
+                if any(x in s for x in ["btc", "eth", "bnb", "xau", "xag", "sol", "weth", "fdusd"]):
+                    if "xau" in s: s = "xauusdt"
+                    elif "xag" in s: s = "xagusdt"
+                    elif not s.endswith("usdt") and not s.endswith("fdusd"):
+                        s = s.replace("usd", "").replace("usds", "") + "usdt"
                 clean_symbols.append(s)
 
-            # Limit and remove duplicates
             streams = [f"{s}@ticker" for s in set(clean_symbols) if s]
             url = f"wss://stream.binance.com:9443/ws/{'/'.join(streams)}"
             
@@ -83,11 +87,11 @@ def run_binance():
                 d = json.loads(msg)
                 if 's' in d and 'c' in d: update_firebase(d['s'], d['c'])
             
-            print(f"🚀 Connecting to Binance: {len(streams)} symbols")
+            print(f"🚀 Connecting: {len(streams)} streams")
             ws = websocket.WebSocketApp(url, on_message=on_msg)
             ws.run_forever(ping_interval=25, ping_timeout=15)
         except Exception as e:
-            print(f"🔄 Binance Reconnect: {e}"); eventlet.sleep(5)
+            print(f"🔄 Reconnect: {e}"); eventlet.sleep(5)
 
 # --- 5. SYSTEM START ---
 def start_listener():
