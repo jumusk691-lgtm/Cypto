@@ -23,23 +23,27 @@ def get_signature(timestamp):
     signature_data = "GET" + timestamp + "/v2/l2update"
     return hmac.new(API_SECRET.encode('utf-8'), signature_data.encode('utf-8'), hashlib.sha256).hexdigest()
 
-# --- 3. LIVE UPDATE ---
+# --- 3. LIVE UPDATE (Firebase write optimized) ---
 def handle_price_update(symbol, price):
     try:
         if not price: return
         p_str = "{:.2f}".format(float(price)) 
         time_str = datetime.datetime.now().strftime("%H:%M:%S")
         updates = {}
+        
         if symbol in node_references:
             for node_id in node_references[symbol]:
                 updates[f"forex_watchlist/{node_id}/price"] = p_str
                 updates[f"forex_watchlist/{node_id}/utime"] = time_str
+        
         if updates:
             db.reference().update(updates)
-            print(f"✅ Price Sync: {symbol} -> {p_str}")
+            # Sirf important updates print honge taaki logs overflow na ho
+            if time.time() % 5 < 1: 
+                print(f"📊 Live Sync: {symbol} @ {p_str}")
     except: pass
 
-# --- 4. SYNC WATCHLIST (Rate Limit Safe) ---
+# --- 4. SYNC WATCHLIST (Symbol Mapping) ---
 def sync_watchlist(ws):
     global node_references, current_subscriptions
     while True:
@@ -52,7 +56,10 @@ def sync_watchlist(ws):
             for node_id, fields in data.items():
                 raw_sym = fields.get('symbol', '').upper()
                 if not raw_sym: continue
-                clean_sym = raw_sym.split('_')[0] 
+                
+                # Delta Exchange ke liye symbol clean karein (e.g. BTC_USDT -> BTCUSDT)
+                clean_sym = raw_sym.replace('_', '') 
+
                 if clean_sym not in temp_map:
                     temp_map[clean_sym] = []
                     if clean_sym not in current_subscriptions:
@@ -62,27 +69,30 @@ def sync_watchlist(ws):
             node_references = temp_map
 
             if new_symbols and ws.sock and ws.sock.connected:
-                # Delta Exchange ko request bhejte waqt gap dena zaroori hai
                 sub_msg = {
                     "type": "subscribe",
                     "payload": {"channels": [{"name": "v2/ticker", "symbols": new_symbols}]}
                 }
                 ws.send(json.dumps(sub_msg))
                 current_subscriptions.update(new_symbols)
-                print(f"🚀 New Subscriptions: {new_symbols}")
+                print(f"🚀 Subscribed to New Pairs: {new_symbols}")
 
-            eventlet.sleep(60) # Firebase sync interval ko 1 minute kar diya hai taaki limit na hit ho
+            eventlet.sleep(45) 
         except: eventlet.sleep(10)
 
-# --- 5. ENGINE (Wait Logic) ---
+# --- 5. ENGINE (Wait for 429 Recovery) ---
 def start_engine():
-    wait_time = 10 # 429 error se bachne ke liye starting wait badha diya
+    # Pehla wait 5 min ka kyunki aapka API block hai
+    print("⏳ Waiting for API cooldown (60s)...")
+    eventlet.sleep(60) 
+    
+    wait_time = 15
     while True:
         try:
             url = "wss://socket.delta.exchange/v2/l2update" 
             
             def on_open(ws):
-                print("🌐 Engine Connected. Authenticating...")
+                print("🌐 Socket Connected!")
                 ts = str(int(time.time()))
                 auth_payload = {
                     "type": "auth",
@@ -96,6 +106,8 @@ def start_engine():
                 d = json.loads(msg)
                 if d.get('type') == 'v2/ticker':
                     handle_price_update(d.get('symbol'), d.get('mark_price'))
+                elif d.get('type') == 'error':
+                    print(f"❌ Delta Error: {d.get('payload')}")
 
             ws = websocket.WebSocketApp(
                 url, 
@@ -103,14 +115,14 @@ def start_engine():
                 on_open=on_open, 
                 on_message=on_message
             )
-            ws.run_forever(ping_interval=30, ping_timeout=15)
+            ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
-            print(f"🔄 Connection Error. Retrying in {wait_time}s...")
+            print(f"🔄 Reconnect Loop. Waiting {wait_time}s...")
             eventlet.sleep(wait_time)
-            wait_time = min(wait_time * 2, 120) # Error aane par wait time badhta jayega
+            wait_time = min(wait_time * 2, 300)
 
 @app.route('/')
-def health(): return "LIVE_ENGINE_ACTIVE"
+def health(): return "LIVE"
 
 if __name__ == '__main__':
     eventlet.spawn(start_engine)
