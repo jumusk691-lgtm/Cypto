@@ -20,7 +20,6 @@ current_subscriptions = set()
 
 # --- 2. AUTH SIGNATURE ---
 def get_signature(timestamp):
-    # Delta requires: Method + Timestamp + Path
     signature_data = "GET" + timestamp + "/v2/l2update"
     return hmac.new(API_SECRET.encode('utf-8'), signature_data.encode('utf-8'), hashlib.sha256).hexdigest()
 
@@ -37,9 +36,10 @@ def handle_price_update(symbol, price):
                 updates[f"forex_watchlist/{node_id}/utime"] = time_str
         if updates:
             db.reference().update(updates)
+            print(f"✅ Price Sync: {symbol} -> {p_str}")
     except: pass
 
-# --- 4. SYNC WATCHLIST (Throttled) ---
+# --- 4. SYNC WATCHLIST (Rate Limit Safe) ---
 def sync_watchlist(ws):
     global node_references, current_subscriptions
     while True:
@@ -62,29 +62,27 @@ def sync_watchlist(ws):
             node_references = temp_map
 
             if new_symbols and ws.sock and ws.sock.connected:
-                # Delta Exchange rate limit se bachne ke liye symbols ko batches mein bhejenge
+                # Delta Exchange ko request bhejte waqt gap dena zaroori hai
                 sub_msg = {
                     "type": "subscribe",
                     "payload": {"channels": [{"name": "v2/ticker", "symbols": new_symbols}]}
                 }
                 ws.send(json.dumps(sub_msg))
                 current_subscriptions.update(new_symbols)
-                print(f"🚀 Subscribed to: {new_symbols}")
+                print(f"🚀 New Subscriptions: {new_symbols}")
 
-            eventlet.sleep(30) # Firebase sync interval badha diya hai
+            eventlet.sleep(60) # Firebase sync interval ko 1 minute kar diya hai taaki limit na hit ho
         except: eventlet.sleep(10)
 
-# --- 5. ENGINE (Exponential Backoff Fix) ---
+# --- 5. ENGINE (Wait Logic) ---
 def start_engine():
-    retry_delay = 5 # Starting delay 5 seconds
+    wait_time = 10 # 429 error se bachne ke liye starting wait badha diya
     while True:
         try:
             url = "wss://socket.delta.exchange/v2/l2update" 
             
             def on_open(ws):
-                nonlocal retry_delay
-                retry_delay = 5 # Reset delay on success
-                print("🌐 Socket Open & Authenticating...")
+                print("🌐 Engine Connected. Authenticating...")
                 ts = str(int(time.time()))
                 auth_payload = {
                     "type": "auth",
@@ -98,8 +96,6 @@ def start_engine():
                 d = json.loads(msg)
                 if d.get('type') == 'v2/ticker':
                     handle_price_update(d.get('symbol'), d.get('mark_price'))
-                elif "error" in d:
-                    print(f"⚠️ API Error: {d['error']}")
 
             ws = websocket.WebSocketApp(
                 url, 
@@ -109,12 +105,12 @@ def start_engine():
             )
             ws.run_forever(ping_interval=30, ping_timeout=15)
         except Exception as e:
-            print(f"🔄 Rate Limit/Connection Error. Waiting {retry_delay}s...")
-            eventlet.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 60) # Har baar wait time double karega (max 60s)
+            print(f"🔄 Connection Error. Retrying in {wait_time}s...")
+            eventlet.sleep(wait_time)
+            wait_time = min(wait_time * 2, 120) # Error aane par wait time badhta jayega
 
 @app.route('/')
-def health(): return {"status": "running", "pairs": list(current_subscriptions)}
+def health(): return "LIVE_ENGINE_ACTIVE"
 
 if __name__ == '__main__':
     eventlet.spawn(start_engine)
