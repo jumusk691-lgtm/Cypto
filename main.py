@@ -1,111 +1,127 @@
 import eventlet
 eventlet.monkey_patch()
-import os, datetime, json, firebase_admin, websocket, time
+import os, datetime, json, firebase_admin, websocket, time, hmac, hashlib, io
 from firebase_admin import credentials, db
+from flask import Flask, request, send_file
 
-# --- 1. FIREBASE SETUP ---
+# --- 1. CONFIGURATION ---
+API_KEY = "YOUR_DELTA_API_KEY"
+API_SECRET = "YOUR_DELTA_API_SECRET"
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
+DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
+
 if not firebase_admin._apps:
     cred = credentials.Certificate(KEY_FILE)
-    firebase_admin.initialize_app(cred, {'databaseURL': 'https://trade-f600a-default-rtdb.firebaseio.com/'})
+    firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
 
-# ट्रैकिंग के लिए वेरिएबल्स
-subscribed_symbols = set()   # Unique symbols for Binance
-last_update_time = {}       # 2-sec delay logic
-node_references = {}        # Symbol to Firebase Node mapping
+app = Flask(__name__)
 
-# --- 2. LIVE PRICE OVERWRITE LOGIC ---
-def handle_price_update(binance_symbol, price):
+# ट्रैकिंग वेरिएबल्स
+node_references = {}  
+last_update_time = {}
+open_prices = {} # 24h Open price store karne ke liye
+
+# --- 2. DELTA AUTH & PCHANGE LOGIC ---
+def get_delta_signature(method, timestamp, path, query="", body=""):
+    payload = method + timestamp + path + query + body
+    return hmac.new(API_SECRET.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+
+def calculate_pchange(current_price, open_price):
     try:
-        current_time = time.time()
-        
-        # 2 सेकंड का थ्रॉटल (Throttle) ताकि रेंडर लॉग्स और फायरबेस साफ़ रहे
-        if binance_symbol in last_update_time:
-            if current_time - last_update_time[binance_symbol] < 2:
-                return
+        if not open_price or float(open_price) == 0: return "0.00"
+        change = ((float(current_price) - float(open_price)) / float(open_price)) * 100
+        return "%.2f" % change
+    except: return "0.00"
+
+# --- 3. LIVE PRICE & BATCH UPDATE ---
+def handle_price_update(symbol, price, open_p=None):
+    try:
+        now = time.time()
+        if symbol in last_update_time and (now - last_update_time[symbol] < 2):
+            return # 2-sec throttle like big brokers
 
         p_str = "%.2f" % float(price)
-        now_str = datetime.datetime.now().strftime("%H:%M:%S")
-        incoming_sym = binance_symbol.upper()
+        change_str = calculate_pchange(price, open_p)
+        time_str = datetime.datetime.now().strftime("%H:%M:%S")
         
         updates = {}
-        # अब हम सीधा सिम्बल के आधार पर मैप किए गए नोड्स को अपडेट करेंगे
-        if incoming_sym in node_references:
-            for node_id in node_references[incoming_sym]:
+        sym_upper = symbol.upper()
+        if sym_upper in node_references:
+            for node_id in node_references[sym_upper]:
                 updates[f"forex_watchlist/{node_id}/price"] = p_str
-                updates[f"forex_watchlist/{node_id}/utime"] = now_str
+                updates[f"forex_watchlist/{node_id}/pChange"] = change_str
+                updates[f"forex_watchlist/{node_id}/utime"] = time_str
         
         if updates:
             db.reference().update(updates)
-            last_update_time[binance_symbol] = current_time
-            # साफ़ लॉग्स
-            print(f"✅ {incoming_sym} Overwritten: {p_str}")
+            last_update_time[symbol] = now
+    except: pass
 
-    except Exception as e:
-        pass # Errors hide for clean logs
+# --- 4. MEMORY STREAMING (NO FILE ON RENDER) ---
+@app.route('/sync-symbols')
+def sync_symbols():
+    """
+    User ka phone yaha se naya data 'khinchega'. 
+    Render par koi file save nahi hogi, sab RAM se stream hoga.
+    """
+    last_id = request.args.get('last_id', 0)
+    # EXAMPLE DATA: Reality me aap ise database se fetch karenge
+    new_data = [
+        {"id": 5001, "symbol": "PEPEUSDT", "name": "Pepe", "token": "999"},
+        {"id": 5002, "symbol": "FLOKIUSDT", "name": "Floki", "token": "888"}
+    ]
+    
+    # Bytes me convert karke stream karna
+    mem_file = io.BytesIO()
+    mem_file.write(json.dumps(new_data).encode())
+    mem_file.seek(0)
+    
+    return send_file(mem_file, mimetype='application/json', download_name='update.json')
 
-# --- 3. SYNC ENGINE (Based on 'symbol' field) ---
+# --- 5. WEBSOCKET ENGINE ---
 def start_engine():
-    global subscribed_symbols, node_references
+    global node_references, open_prices
     while True:
         try:
-            # 1. Firebase से डेटा उठाना
             data = db.reference('forex_watchlist').get() or {}
-            
-            temp_node_map = {}
-            new_streams = []
+            temp_map = {}
+            symbols_to_subscribe = []
 
             for node_id, fields in data.items():
-                # UUID चेक नहीं करना, सीधा 'symbol' फील्ड उठाना है
-                sym_field = fields.get('symbol')
-                if not sym_field: continue
+                sym = fields.get('symbol', '').upper()
+                if not sym: continue
                 
-                sym_upper = sym_field.upper()
-                
-                # मैपिंग बनाना: 'BTCUSDT' -> ['BTCUSDT_uid1', 'BTCUSDT_uid2']
-                if sym_upper not in temp_node_map:
-                    temp_node_map[sym_upper] = []
-                temp_node_map[sym_upper].append(node_id)
-                
-                # Binance के लिए स्ट्रीम तैयार करना
-                stream_name = sym_upper.lower()
-                if not (stream_name.endswith("usdt") or stream_name.endswith("fdusd")):
-                    stream_name += "usdt"
-                
-                full_stream = f"{stream_name}@ticker"
-                if full_stream not in subscribed_symbols:
-                    subscribed_symbols.add(full_stream)
-                    new_streams.append(full_stream)
-
-            node_references = temp_node_map
-
-            # 2. अगर कोई नया सिम्बल मिला, तो सॉकेट रीस्टार्ट करें
-            if new_streams or not subscribed_symbols:
-                all_streams = list(subscribed_symbols)
-                url = f"wss://stream.binance.com:9443/ws/{'/'.join(all_streams)}"
-                
-                def on_msg(ws, msg):
-                    d = json.loads(msg)
-                    if 's' in d and 'c' in d:
-                        handle_price_update(d['s'], d['c'])
-
-                print(f"🚀 Streaming started for symbols: {list(temp_node_map.keys())}")
-                ws = websocket.WebSocketApp(url, on_message=on_msg)
-                ws.run_forever(ping_interval=20, ping_timeout=10)
+                if sym not in temp_map:
+                    temp_map[sym] = []
+                    symbols_to_subscribe.append(sym.lower())
+                temp_map[sym].append(node_id)
             
-            eventlet.sleep(10) # हर 10 सेकंड में नई एंट्री चेक करें
-        except Exception as e:
+            node_references = temp_map
+
+            # Delta Exchange WebSocket URL (Example)
+            url = "wss://api.delta.exchange/v2/l2update" 
+            
+            def on_msg(ws, msg):
+                d = json.loads(msg)
+                # Delta API structure ke hisab se parse karein
+                if 'symbol' in d and 'price' in d:
+                    handle_price_update(d['symbol'], d['price'], open_prices.get(d['symbol']))
+
+            ws = websocket.WebSocketApp(url, on_message=on_msg)
+            ws.run_forever(ping_interval=30)
+            
+            eventlet.sleep(10)
+        except:
             eventlet.sleep(5)
 
-# --- 4. RENDER SERVER ---
+# --- 6. RENDER SERVER START ---
+@app.route('/')
+def health_check():
+    return "BROKER_ENGINE_ACTIVE"
+
 if __name__ == '__main__':
-    print("🔥 SYMBOL-BASED ENGINE ACTIVE...")
     eventlet.spawn(start_engine)
-    
-    from eventlet import wsgi
-    def app(env, start_res):
-        start_res('200 OK', [('Content-Type', 'text/plain')])
-        return [b"ACTIVE"]
-    
     port = int(os.environ.get("PORT", 10000))
-    wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
+    # Flask app as Render Server
+    import eventlet.wsgi
+    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
