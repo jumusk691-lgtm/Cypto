@@ -1,10 +1,14 @@
 import eventlet
 eventlet.monkey_patch()
-import os, datetime, json, firebase_admin, websocket, time
+import os, datetime, json, firebase_admin, websocket, time, hmac, hashlib
 from firebase_admin import credentials, db
 from flask import Flask
 
 # --- 1. CONFIGURATION ---
+# Aapki provide ki hui Keys
+API_KEY = "GGJkcBos5OVsqOgKVnyGq0eUMPLB1n"
+API_SECRET = "yN23fyqfDj5MmjT9JQfn1MuMcmXkzaEjqwL2lW9At5BN7oADpcm8zoQN84Dp"
+
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
 
@@ -19,10 +23,30 @@ app = Flask(__name__)
 node_references = {}  
 current_subscriptions = set()
 
-# --- 2. LIVE UPDATE LOGIC ---
+# --- 2. AUTHENTICATION HELPER ---
+def get_auth_headers():
+    # Delta Exchange Auth Signature Logic
+    method = 'GET'
+    timestamp = str(int(time.time()))
+    path = '/link/v1/ticker' # WebSocket auth path
+    payload = ""
+    signature_data = method + timestamp + path + payload
+    signature = hmac.new(
+        API_SECRET.encode('utf-8'),
+        signature_data.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+
+    return {
+        "api-key": API_KEY,
+        "api-signature": signature,
+        "api-timestamp": timestamp,
+        "User-Agent": "Mozilla/5.0"
+    }
+
+# --- 3. LIVE UPDATE LOGIC ---
 def handle_price_update(symbol, price):
     try:
-        # Forex ke liye 4 ya 2 decimal (as per need)
         p_str = "{:.2f}".format(float(price)) 
         time_str = datetime.datetime.now().strftime("%H:%M:%S")
         updates = {}
@@ -34,44 +58,37 @@ def handle_price_update(symbol, price):
         
         if updates:
             db.reference().update(updates)
-            # Bahut saare logs se bachne ke liye sirf print karein jab price update ho
+            print(f"✅ Updated {symbol}: {p_str}")
     except:
         pass
 
-# --- 3. DYNAMIC SYMBOL PICKER ---
+# --- 4. DYNAMIC SYMBOL PICKER ---
 def sync_watchlist(ws):
     global node_references, current_subscriptions
     while True:
         try:
             ref = db.reference('forex_watchlist')
             data = ref.get() or {}
-            
             temp_map = {}
             new_symbols = []
 
             for node_id, fields in data.items():
                 raw_sym = fields.get('symbol', '').upper()
                 if not raw_sym: continue
-                
-                # Clean Symbol Logic: "AMZNXUSDT_UID" -> "AMZNXUSDT"
                 clean_sym = raw_sym.split('_')[0] 
 
                 if clean_sym not in temp_map:
                     temp_map[clean_sym] = []
                     if clean_sym not in current_subscriptions:
                         new_symbols.append(clean_sym)
-                
                 temp_map[clean_sym].append(node_id)
             
             node_references = temp_map
 
-            # Delta Exchange Subscribe
             if new_symbols and ws.sock and ws.sock.connected:
                 sub_msg = {
                     "type": "subscribe",
-                    "payload": {
-                        "channels": [{"name": "v2/ticker", "symbols": new_symbols}]
-                    }
+                    "payload": {"channels": [{"name": "v2/ticker", "symbols": new_symbols}]}
                 }
                 ws.send(json.dumps(sub_msg))
                 current_subscriptions.update(new_symbols)
@@ -82,19 +99,15 @@ def sync_watchlist(ws):
             print(f"⚠️ Sync Error: {e}")
             eventlet.sleep(5)
 
-# --- 4. WEBSOCKET ENGINE (Fixes 403 Forbidden) ---
+# --- 5. WEBSOCKET ENGINE ---
 def start_engine():
     while True:
         try:
+            # Authenticated URL
             url = "wss://api.delta.exchange/v2/l2update" 
             
-            # Browser jaisa behavior dikhane ke liye headers
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-            
             def on_open(ws):
-                print("🌐 Engine Connected (403 Bypass Active)")
+                print("🌐 Engine Connected with API Key")
                 current_subscriptions.clear()
                 eventlet.spawn(sync_watchlist, ws)
 
@@ -107,28 +120,26 @@ def start_engine():
                         handle_price_update(sym, price)
 
             def on_error(ws, error):
-                print(f"❌ WebSocket Error: {error}")
+                print(f"❌ WS Error: {error}")
 
-            # 'header' parameter yahan add kiya gaya hai
             ws = websocket.WebSocketApp(
                 url, 
-                header=headers,
+                header=get_auth_headers(), # Yahan key use ho rahi hai
                 on_open=on_open, 
                 on_message=on_message,
                 on_error=on_error
             )
-            ws.run_forever(ping_interval=20, ping_timeout=10)
+            ws.run_forever(ping_interval=20)
         except Exception as e:
-            print(f"🔄 Engine Restarting: {e}")
+            print(f"🔄 Restarting: {e}")
             eventlet.sleep(5)
 
 @app.route('/')
 def health(): 
-    return {"status": "active", "active_pairs": list(current_subscriptions)}
+    return {"status": "active", "pairs": list(current_subscriptions)}
 
 if __name__ == '__main__':
     eventlet.spawn(start_engine)
     port = int(os.environ.get("PORT", 10000))
     import eventlet.wsgi
-    print(f"🔥 Live Price Engine running on port {port}")
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
