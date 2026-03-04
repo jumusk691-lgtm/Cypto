@@ -1,12 +1,10 @@
 import eventlet
 eventlet.monkey_patch()
-import os, datetime, json, firebase_admin, websocket, time, hmac, hashlib, io
+import os, datetime, json, firebase_admin, websocket, time, io
 from firebase_admin import credentials, db
 from flask import Flask, request, send_file
 
 # --- 1. CONFIGURATION ---
-API_KEY = "GGJkcBos5OVsqOgKVnyGq0eUMPLB1n"
-API_SECRET = "yN23fyqfDj5MmjT9JQfn1MuMcmXkzaEjqwL2lW9At5BN7oADpcm8zoQN84Dp"
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
 
@@ -16,15 +14,14 @@ if not firebase_admin._apps:
 
 app = Flask(__name__)
 
-# थ्रॉटलिंग के लिए वेरिएबल्स
 node_references = {}  
 last_update_time = {}
 
-# --- 2. LOGIC: LIVE PRICE UPDATE ---
+# --- 2. LOGIC: FIREBASE REALTIME PRICE UPDATE ---
 def handle_price_update(symbol, price):
     try:
         now = time.time()
-        # बड़े ब्रोकर्स वाला 2-सेकंड थ्रॉटल लॉजिक
+        # 2-sec throttle (Broker Logic)
         if symbol in last_update_time and (now - last_update_time[symbol] < 2):
             return 
 
@@ -34,51 +31,38 @@ def handle_price_update(symbol, price):
         updates = {}
         sym_upper = symbol.upper()
         
-        # Batch Update Logic: एक साथ कई नोड्स अपडेट करना
         if sym_upper in node_references:
             for node_id in node_references[sym_upper]:
+                # As per your Firebase structure
                 updates[f"forex_watchlist/{node_id}/price"] = p_str
                 updates[f"forex_watchlist/{node_id}/utime"] = time_str
         
         if updates:
             db.reference().update(updates)
             last_update_time[symbol] = now
-            print(f"✅ UPDATED: {sym_upper} -> {p_str}")
+            print(f"🔥 LIVE: {sym_upper} -> {p_str}") # Logs mein ye dikhna chahiye
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Update Error: {e}")
 
-# --- 3. LOGIC: ON-THE-FLY MEMORY STREAMING ---
+# --- 3. LOGIC: ON-THE-FLY SYNC (Memory Streaming) ---
 @app.route('/sync-symbols')
 def sync_symbols():
-    """
-    बिना फाइल सेव किए नए Forex सिम्बल्स स्ट्रीम करना।
-    User की ऐप यहाँ से चुपचाप नया डेटा 'खिंचेगी'।
-    """
     last_id = int(request.args.get('last_id', 0))
-    
-    # यहाँ आप अपने नए 125+ Forex सिम्बल्स की लिस्ट रखेंगे
-    all_new_symbols = [
-        {"id": 1001, "symbol": "EURUSD", "name": "Euro / US Dollar", "token": "fx_101"},
-        {"id": 1002, "symbol": "GBPUSD", "name": "British Pound", "token": "fx_102"},
-        # ... बाकी सिम्बल्स यहाँ आएंगे
-    ]
-    
-    # सिर्फ वो सिम्बल्स जो यूजर के पास नहीं हैं
+    # Add your Forex symbols here
+    all_new_symbols = [{"id": 1001, "symbol": "AAPLXUSDT", "name": "Apple Crypto"}]
     filtered_data = [s for s in all_new_symbols if s['id'] > last_id]
     
-    # No-Storage Logic: RAM से सीधे डेटा भेजना
     mem_file = io.BytesIO()
     mem_file.write(json.dumps(filtered_data).encode())
     mem_file.seek(0)
-    
     return send_file(mem_file, mimetype='application/json')
 
-# --- 4. LOGIC: DELTA WEBSOCKET ENGINE ---
+# --- 4. LOGIC: DELTA WEBSOCKET ENGINE (Subscription Fix) ---
 def start_engine():
     global node_references
     while True:
         try:
-            # Firebase से वाचलिस्ट सिंक करना
+            # Firebase se watchlist fetch karna
             data = db.reference('forex_watchlist').get() or {} 
             temp_map = {}
             symbols_to_subscribe = []
@@ -94,11 +78,15 @@ def start_engine():
             
             node_references = temp_map
             
-            # Delta Exchange WebSocket URL
+            if not symbols_to_subscribe:
+                print("⚠️ No symbols found in Firebase. Waiting...")
+                eventlet.sleep(10)
+                continue
+
             url = "wss://api.delta.exchange/v2/l2update" 
             
             def on_open(ws):
-                # Delta API Ticker Subscription
+                # Correct Delta Subscription Message
                 sub_msg = {
                     "type": "subscribe",
                     "payload": {
@@ -106,6 +94,7 @@ def start_engine():
                     }
                 }
                 ws.send(json.dumps(sub_msg))
+                print(f"🚀 Subscribed to: {symbols_to_subscribe}")
 
             def on_message(ws, msg):
                 d = json.loads(msg)
@@ -116,12 +105,12 @@ def start_engine():
             ws.run_forever(ping_interval=30)
             
         except Exception as e:
-            print(f"⚠️ Reconnecting... {e}")
+            print(f"⚠️ Socket Restarting: {e}")
             eventlet.sleep(5)
 
-# --- 5. RENDER SERVER CONFIG ---
+# --- 5. RENDER SETUP ---
 @app.route('/')
-def health(): return "FOREX_ENGINE_ACTIVE"
+def health(): return "ACTIVE"
 
 if __name__ == '__main__':
     eventlet.spawn(start_engine)
