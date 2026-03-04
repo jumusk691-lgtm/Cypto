@@ -5,7 +5,6 @@ from firebase_admin import credentials, db
 from flask import Flask
 
 # --- 1. CONFIGURATION ---
-# Aapki provide ki hui Keys
 API_KEY = "GGJkcBos5OVsqOgKVnyGq0eUMPLB1n"
 API_SECRET = "yN23fyqfDj5MmjT9JQfn1MuMcmXkzaEjqwL2lW9At5BN7oADpcm8zoQN84Dp"
 
@@ -13,56 +12,39 @@ KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
 
 if not firebase_admin._apps:
-    try:
-        cred = credentials.Certificate(KEY_FILE)
-        firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
-    except Exception as e:
-        print(f"❌ Firebase Init Error: {e}")
+    cred = credentials.Certificate(KEY_FILE)
+    firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
 
 app = Flask(__name__)
 node_references = {}  
 current_subscriptions = set()
 
-# --- 2. AUTHENTICATION HELPER ---
-def get_auth_headers():
-    # Delta Exchange Auth Signature Logic
-    method = 'GET'
-    timestamp = str(int(time.time()))
-    path = '/link/v1/ticker' # WebSocket auth path
-    payload = ""
-    signature_data = method + timestamp + path + payload
-    signature = hmac.new(
+# --- 2. AUTH SIGNATURE ---
+def get_signature(timestamp):
+    payload = "" # WebSocket auth ke liye empty payload
+    signature_data = "GET" + timestamp + "/v2/l2update" + payload
+    return hmac.new(
         API_SECRET.encode('utf-8'),
         signature_data.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
 
-    return {
-        "api-key": API_KEY,
-        "api-signature": signature,
-        "api-timestamp": timestamp,
-        "User-Agent": "Mozilla/5.0"
-    }
-
-# --- 3. LIVE UPDATE LOGIC ---
+# --- 3. LIVE UPDATE ---
 def handle_price_update(symbol, price):
     try:
         p_str = "{:.2f}".format(float(price)) 
         time_str = datetime.datetime.now().strftime("%H:%M:%S")
         updates = {}
-        
         if symbol in node_references:
             for node_id in node_references[symbol]:
                 updates[f"forex_watchlist/{node_id}/price"] = p_str
                 updates[f"forex_watchlist/{node_id}/utime"] = time_str
-        
         if updates:
             db.reference().update(updates)
-            print(f"✅ Updated {symbol}: {p_str}")
-    except:
-        pass
+            print(f"✅ Live: {symbol} -> {p_str}")
+    except: pass
 
-# --- 4. DYNAMIC SYMBOL PICKER ---
+# --- 4. SYNC WATCHLIST ---
 def sync_watchlist(ws):
     global node_references, current_subscriptions
     while True:
@@ -76,7 +58,6 @@ def sync_watchlist(ws):
                 raw_sym = fields.get('symbol', '').upper()
                 if not raw_sym: continue
                 clean_sym = raw_sym.split('_')[0] 
-
                 if clean_sym not in temp_map:
                     temp_map[clean_sym] = []
                     if clean_sym not in current_subscriptions:
@@ -84,59 +65,48 @@ def sync_watchlist(ws):
                 temp_map[clean_sym].append(node_id)
             
             node_references = temp_map
-
             if new_symbols and ws.sock and ws.sock.connected:
-                sub_msg = {
-                    "type": "subscribe",
-                    "payload": {"channels": [{"name": "v2/ticker", "symbols": new_symbols}]}
-                }
+                sub_msg = {"type": "subscribe", "payload": {"channels": [{"name": "v2/ticker", "symbols": new_symbols}]}}
                 ws.send(json.dumps(sub_msg))
                 current_subscriptions.update(new_symbols)
-                print(f"🚀 Subscribed to: {new_symbols}")
-
+                print(f"🚀 Subscribing: {new_symbols}")
             eventlet.sleep(15) 
-        except Exception as e:
-            print(f"⚠️ Sync Error: {e}")
-            eventlet.sleep(5)
+        except: eventlet.sleep(5)
 
-# --- 5. WEBSOCKET ENGINE ---
+# --- 5. ENGINE (URL & AUTH FIX) ---
 def start_engine():
     while True:
         try:
-            # Authenticated URL
-            url = "wss://api.delta.exchange/v2/l2update" 
+            # Sahi WebSocket URL (wss:// socket.delta.exchange)
+            url = "wss://socket.delta.exchange/v2/l2update" 
             
             def on_open(ws):
-                print("🌐 Engine Connected with API Key")
+                print("🌐 Socket Connected")
+                # Auth Step
+                ts = str(int(time.time()))
+                auth_msg = {
+                    "type": "auth",
+                    "payload": {
+                        "api-key": API_KEY,
+                        "signature": get_signature(ts),
+                        "timestamp": ts
+                    }
+                }
+                ws.send(json.dumps(auth_msg))
                 current_subscriptions.clear()
                 eventlet.spawn(sync_watchlist, ws)
 
             def on_message(ws, msg):
-                data = json.loads(msg)
-                if data.get('type') == 'v2/ticker':
-                    sym = data.get('symbol')
-                    price = data.get('mark_price')
-                    if sym and price:
-                        handle_price_update(sym, price)
+                d = json.loads(msg)
+                if d.get('type') == 'v2/ticker':
+                    handle_price_update(d.get('symbol'), d.get('mark_price'))
 
-            def on_error(ws, error):
-                print(f"❌ WS Error: {error}")
-
-            ws = websocket.WebSocketApp(
-                url, 
-                header=get_auth_headers(), # Yahan key use ho rahi hai
-                on_open=on_open, 
-                on_message=on_message,
-                on_error=on_error
-            )
-            ws.run_forever(ping_interval=20)
-        except Exception as e:
-            print(f"🔄 Restarting: {e}")
-            eventlet.sleep(5)
+            ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message)
+            ws.run_forever(ping_interval=25)
+        except: eventlet.sleep(5)
 
 @app.route('/')
-def health(): 
-    return {"status": "active", "pairs": list(current_subscriptions)}
+def health(): return "LIVE"
 
 if __name__ == '__main__':
     eventlet.spawn(start_engine)
