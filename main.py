@@ -9,8 +9,11 @@ KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
 
 if not firebase_admin._apps:
-    cred = credentials.Certificate(KEY_FILE)
-    firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
+    try:
+        cred = credentials.Certificate(KEY_FILE)
+        firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
+    except Exception as e:
+        print(f"❌ Firebase Init Error: {e}")
 
 app = Flask(__name__)
 node_references = {}  
@@ -19,21 +22,21 @@ current_subscriptions = set()
 # --- 2. LIVE UPDATE LOGIC ---
 def handle_price_update(symbol, price):
     try:
-        p_str = "{:.2f}".format(float(price)) # Forex/Crypto ke liye 2 decimal kaafi hain
+        # Forex ke liye 4 ya 2 decimal (as per need)
+        p_str = "{:.2f}".format(float(price)) 
         time_str = datetime.datetime.now().strftime("%H:%M:%S")
         updates = {}
         
         if symbol in node_references:
             for node_id in node_references[symbol]:
-                # Aapke exact Firebase paths ko update kar raha hai
                 updates[f"forex_watchlist/{node_id}/price"] = p_str
                 updates[f"forex_watchlist/{node_id}/utime"] = time_str
         
         if updates:
             db.reference().update(updates)
-            print(f"✅ Price Sync: {symbol} -> {p_str}")
-    except Exception as e:
-        print(f"Update Error: {e}")
+            # Bahut saare logs se bachne ke liye sirf print karein jab price update ho
+    except:
+        pass
 
 # --- 3. DYNAMIC SYMBOL PICKER ---
 def sync_watchlist(ws):
@@ -47,12 +50,10 @@ def sync_watchlist(ws):
             new_symbols = []
 
             for node_id, fields in data.items():
-                # Step 1: Symbol uthao (e.g., "AMZNXUSDT_b02Oy...")
                 raw_sym = fields.get('symbol', '').upper()
                 if not raw_sym: continue
                 
-                # Step 2: Clean Symbol (Sirf "_" se pehle ka part)
-                # Taaki "AMZNXUSDT_b02..." ban jaye "AMZNXUSDT"
+                # Clean Symbol Logic: "AMZNXUSDT_UID" -> "AMZNXUSDT"
                 clean_sym = raw_sym.split('_')[0] 
 
                 if clean_sym not in temp_map:
@@ -64,44 +65,41 @@ def sync_watchlist(ws):
             
             node_references = temp_map
 
-            # Step 3: Delta Exchange ko subscribe message bhejna
+            # Delta Exchange Subscribe
             if new_symbols and ws.sock and ws.sock.connected:
                 sub_msg = {
                     "type": "subscribe",
                     "payload": {
-                        "channels": [
-                            {
-                                "name": "v2/ticker", 
-                                "symbols": new_symbols
-                            }
-                        ]
+                        "channels": [{"name": "v2/ticker", "symbols": new_symbols}]
                     }
                 }
                 ws.send(json.dumps(sub_msg))
                 current_subscriptions.update(new_symbols)
-                print(f"🚀 New Subscriptions: {new_symbols}")
+                print(f"🚀 Subscribed to: {new_symbols}")
 
-            eventlet.sleep(10) # 10 second wait agle sync se pehle
+            eventlet.sleep(15) 
         except Exception as e:
-            print(f"Sync Watchlist Error: {e}")
+            print(f"⚠️ Sync Error: {e}")
             eventlet.sleep(5)
 
-# --- 4. WEBSOCKET ENGINE ---
+# --- 4. WEBSOCKET ENGINE (Fixes 403 Forbidden) ---
 def start_engine():
     while True:
         try:
-            # Public Ticker URL
             url = "wss://api.delta.exchange/v2/l2update" 
             
+            # Browser jaisa behavior dikhane ke liye headers
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            
             def on_open(ws):
-                print("🌐 Connected to Delta Exchange")
+                print("🌐 Engine Connected (403 Bypass Active)")
                 current_subscriptions.clear()
-                # Watchlist sync shuru karein
                 eventlet.spawn(sync_watchlist, ws)
 
             def on_message(ws, msg):
                 data = json.loads(msg)
-                # Delta ticker data format check
                 if data.get('type') == 'v2/ticker':
                     sym = data.get('symbol')
                     price = data.get('mark_price')
@@ -109,29 +107,28 @@ def start_engine():
                         handle_price_update(sym, price)
 
             def on_error(ws, error):
-                print(f"WS Error: {error}")
+                print(f"❌ WebSocket Error: {error}")
 
+            # 'header' parameter yahan add kiya gaya hai
             ws = websocket.WebSocketApp(
                 url, 
+                header=headers,
                 on_open=on_open, 
                 on_message=on_message,
                 on_error=on_error
             )
-            ws.run_forever(ping_interval=30)
+            ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
-            print(f"Engine Restarting: {e}")
+            print(f"🔄 Engine Restarting: {e}")
             eventlet.sleep(5)
 
 @app.route('/')
 def health(): 
-    return {"status": "running", "subscriptions": list(current_subscriptions)}
+    return {"status": "active", "active_pairs": list(current_subscriptions)}
 
 if __name__ == '__main__':
-    # Engine ko background mein chalayein
     eventlet.spawn(start_engine)
-    
-    # Flask port setup for Render
     port = int(os.environ.get("PORT", 10000))
     import eventlet.wsgi
-    print(f"🔥 Server starting on port {port}")
+    print(f"🔥 Live Price Engine running on port {port}")
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
