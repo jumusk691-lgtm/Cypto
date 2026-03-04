@@ -4,7 +4,7 @@ import os, datetime, json, firebase_admin, websocket, time
 from firebase_admin import credentials, db
 from flask import Flask
 
-# --- CONFIGURATION ---
+# --- 1. CONFIGURATION ---
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
 
@@ -13,72 +13,80 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
 
 app = Flask(__name__)
-
 node_references = {}  
 current_subscriptions = set()
 
-# --- PRICE UPDATE LOGIC ---
+# --- 2. LIVE UPDATE LOGIC (Updates back to forex_watchlist) ---
 def handle_price_update(symbol, price):
     try:
         p_str = "%.4f" % float(price)
+        time_str = datetime.datetime.now().strftime("%H:%M:%S")
         updates = {}
+        
         if symbol in node_references:
             for node_id in node_references[symbol]:
-                # Sirf Price aur Time update
+                # सिर्फ forex_watchlist के अंदर अपडेट
                 updates[f"forex_watchlist/{node_id}/price"] = p_str
-                updates[f"forex_watchlist/{node_id}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
+                updates[f"forex_watchlist/{node_id}/utime"] = time_str
         
         if updates:
             db.reference().update(updates)
-            print(f"⚡ LIVE: {symbol} -> {p_str}")
+            print(f"✅ UPDATED: {symbol} -> {p_str}")
     except: pass
 
-# --- DYNAMIC SCANNER (Every 2 Sec) ---
-def sync_db_with_ws(ws):
+# --- 3. DYNAMIC SYMBOL PICKER (From forex_watchlist) ---
+def sync_watchlist(ws):
     global node_references, current_subscriptions
     while True:
         try:
-            data = db.reference('forex_watchlist').get() or {}
+            # स्टेप: सिर्फ forex_watchlist नोड को पढ़ना
+            ref = db.reference('forex_watchlist')
+            data = ref.get() or {}
+            
             temp_map = {}
-            new_to_subscribe = []
+            new_symbols = []
 
             for node_id, fields in data.items():
-                # Logic: Database se 'symbol' field uthana
-                raw_sym = fields.get('symbol', '').upper()
-                if not raw_sym: continue
+                # डेटाबेस से 'symbol' फील्ड उठाना
+                sym = fields.get('symbol', '').upper()
+                if not sym: continue
                 
-                if raw_sym not in temp_map:
-                    temp_map[raw_sym] = []
-                    if raw_sym not in current_subscriptions:
-                        new_to_subscribe.append(raw_sym)
-                temp_map[raw_sym].append(node_id)
+                # 'GOLDM' या 'MCX' जैसे सिम्बल्स को इग्नोर करना (Delta उन्हें सपोर्ट नहीं करता)
+                if "FUT" in sym or "MCX" in fields.get('exch_seg', ''):
+                    continue
+
+                if sym not in temp_map:
+                    temp_map[sym] = []
+                    if sym not in current_subscriptions:
+                        new_symbols.append(sym)
+                temp_map[sym].append(node_id)
             
             node_references = temp_map
 
-            # Naye symbols subscribe karna
-            if new_to_subscribe and ws.sock and ws.sock.connected:
+            # नए सिम्बल्स को लाइव सब्सक्राइब करना
+            if new_symbols and ws.sock and ws.sock.connected:
                 sub_msg = {
                     "type": "subscribe",
-                    "payload": {"channels": [{"name": "v2/ticker", "symbols": new_to_subscribe}]}
+                    "payload": {"channels": [{"name": "v2/ticker", "symbols": new_symbols}]}
                 }
                 ws.send(json.dumps(sub_msg))
-                current_subscriptions.update(new_to_subscribe)
-                print(f"🆕 Subscribed New: {new_to_subscribe}")
+                current_subscriptions.update(new_symbols)
+                print(f"🚀 Subscribed to New Forex: {new_symbols}")
 
-            eventlet.sleep(2)
+            eventlet.sleep(2) # हर 2 सेकंड में चेक करेगा कि कोई नया सिम्बल तो नहीं आया
         except Exception as e:
-            print(f"Scanner Error: {e}")
+            print(f"Sync Error: {e}")
             eventlet.sleep(5)
 
-# --- WEBSOCKET ENGINE ---
+# --- 4. WEBSOCKET ENGINE ---
 def start_engine():
     while True:
         try:
             url = "wss://api.delta.exchange/v2/l2update" 
             def on_open(ws):
-                print("🌐 WebSocket Connected")
+                print("🌐 Engine Connected to Delta")
                 current_subscriptions.clear()
-                eventlet.spawn(sync_db_with_ws, ws)
+                eventlet.spawn(sync_watchlist, ws)
 
             def on_message(ws, msg):
                 d = json.loads(msg)
@@ -90,7 +98,7 @@ def start_engine():
         except: eventlet.sleep(5)
 
 @app.route('/')
-def health(): return "RUNNING"
+def health(): return "FOREX_LIVE_ENGINE"
 
 if __name__ == '__main__':
     eventlet.spawn(start_engine)
