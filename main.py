@@ -1,6 +1,6 @@
 import eventlet
 eventlet.monkey_patch()
-import os, datetime, json, firebase_admin, websocket, time, sqlite3, requests, yfinance as yf
+import os, datetime, json, firebase_admin, websocket, time, sqlite3, requests
 from firebase_admin import credentials, db
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,103 +18,93 @@ if not firebase_admin._apps:
 app = Flask(__name__)
 node_references = {}  
 
-# --- 2. DB AUTO-UPDATE (Har Deploy aur har 72h par) ---
+# --- 2. DB SYNC (72h Cycle) ---
 def sync_db_to_supabase():
     db_file = "market_data.db"
     if not os.path.exists(db_file): return
     try:
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
-        # Crypto Live Table
         cursor.execute("DROP TABLE IF EXISTS crypto_live")
         cursor.execute("CREATE TABLE crypto_live AS SELECT symbol, 'CRYPTO' as exch_seg FROM crypto")
-        # Global Forex Live Table
         cursor.execute("DROP TABLE IF EXISTS forex_live")
         cursor.execute("CREATE TABLE forex_live AS SELECT AlphabeticCode as symbol, Currency as name, 'FOREX' as exch_seg FROM forex")
         conn.commit()
         conn.close()
-
         with open(db_file, "rb") as f:
             headers = {"Authorization": f"Bearer {SUPABASE_KEY}", "apikey": SUPABASE_KEY, "Content-Type": "application/octet-stream", "x-upsert": "true"}
             requests.post(SUPABASE_DB_URL, headers=headers, data=f)
-            print("🚀 Supabase File Updated Successfully")
-    except Exception as e: print(f"❌ DB Error: {e}")
+            print("🚀 DB Synced")
+    except Exception as e: print(f"❌ DB Sync Error: {e}")
 
-# --- 3. PRICE UPDATER ---
-def update_firebase(symbol, price):
+# --- 3. ZERO-DELAY UPDATER ---
+def update_firebase(binance_sym, price):
     try:
-        # Global Mapping
-        mapping = {"GC=F": "GOLD", "SI=F": "SILVER", "EURUSD=X": "EURUSD", "GBPUSD=X": "GBPUSD"}
-        display_symbol = mapping.get(symbol.upper(), symbol.upper())
+        # Reverse Mapping: Binance sym ko wapas original sym mein badlo
+        rev_map = {"PAXGUSDT": "XAU", "EURUSDT": "EURUSD", "GBPUSDT": "GBPUSD"}
+        original_sym = rev_map.get(binance_sym.upper(), binance_sym.upper())
         
         p_str = "{:.2f}".format(float(price))
         time_str = datetime.datetime.now().strftime("%H:%M:%S")
         updates = {}
         
-        if display_symbol in node_references:
-            for node_id in node_references[display_symbol]:
+        if original_sym in node_references:
+            for node_id in node_references[original_sym]:
                 updates[f"forex_watchlist/{node_id}/price"] = p_str
                 updates[f"forex_watchlist/{node_id}/utime"] = time_str
+        
         if updates: db.reference().update(updates)
     except: pass
 
-# --- 4. GLOBAL FOREX ENGINE (Yahoo - No Key) ---
-def start_global_forex():
-    while True:
-        try:
-            # Sirf Global Symbols
-            forex_list = {"GOLD": "GC=F", "SILVER": "SI=F", "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X"}
-            for name, y_sym in forex_list.items():
-                ticker = yf.Ticker(y_sym)
-                price = ticker.fast_info['last_price']
-                update_firebase(name, price)
-            eventlet.sleep(2)
-        except: eventlet.sleep(5)
-
-# --- 5. BINANCE ENGINE (Crypto) ---
-def start_binance():
+# --- 4. FAST BINANCE ENGINE (All-In-One) ---
+def start_engine():
     global node_references
     while True:
         try:
-            # Watchlist Sync
             data = db.reference('forex_watchlist').get() or {}
-            current_crypto = set()
+            current_subs = set()
             temp_refs = {}
 
             for node_id in data.keys():
+                # Split symbol from Node ID
                 raw_sym = node_id.split('_')[0].upper()
+                
+                # Mapping symbols to Binance pairs for <1s delay
+                binance_pair = raw_sym
+                if raw_sym == "XAU": binance_pair = "PAXGUSDT"
+                elif raw_sym == "EURUSD": binance_pair = "EURUSDT"
+                elif raw_sym == "GBPUSD": binance_pair = "GBPUSDT"
+                
                 if raw_sym not in temp_refs: temp_refs[raw_sym] = []
                 temp_refs[raw_sym].append(node_id)
-                
-                # Check if it's a crypto symbol
-                if any(x in raw_sym for x in ['BTC', 'ETH', 'USDT', 'DOGE', 'SOL']):
-                    current_crypto.add(raw_sym.lower())
+                current_subs.add(binance_pair.lower())
 
             node_references = temp_refs
-            if not current_crypto: 
-                eventlet.sleep(10); continue
-
-            streams = "/".join([f"{s}@ticker" for s in current_crypto])
+            
+            # WebSocket Connection for Real-time speed
+            streams = "/".join([f"{s}@ticker" for s in current_subs])
             url = f"wss://stream.binance.com:9443/ws/{streams}"
+            
             def on_message(ws, msg):
                 d = json.loads(msg)
                 update_firebase(d['s'], d['c'])
-            ws = websocket.WebSocketApp(url, on_message=on_message)
-            ws.run_forever()
-        except: eventlet.sleep(5)
 
-# --- 6. SCHEDULER & FLASK ---
+            ws = websocket.WebSocketApp(url, on_message=on_message)
+            print(f"⚡ Fast Engine Subscribed: {list(current_subs)}")
+            ws.run_forever()
+        except: eventlet.sleep(2)
+
+# --- START ---
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=sync_db_to_supabase, trigger="interval", hours=72)
 scheduler.start()
 
 @app.route('/')
-def health(): return "GLOBAL_MARKET_LIVE"
+def health(): return "ULTRA_FAST_LIVE"
 
 if __name__ == '__main__':
-    sync_db_to_supabase() 
-    eventlet.spawn(start_binance)
-    eventlet.spawn(start_global_forex)
+    sync_db_to_supabase()
+    eventlet.spawn(start_engine)
     port = int(os.environ.get("PORT", 10000))
     import eventlet.wsgi
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
