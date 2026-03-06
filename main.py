@@ -6,6 +6,7 @@ from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # --- 1. CONFIGURATION ---
+# Note: Tiingo key nahi hai toh bhi Crypto aur Gold (Binance se) chalega
 TIINGO_API_KEY = "YOUR_TIINGO_FREE_API_KEY"
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
@@ -19,17 +20,15 @@ if not firebase_admin._apps:
 
 app = Flask(__name__)
 node_references = {}  
-active_crypto_subs = set()
 
 # --- 2. SUPABASE DB AUTO-UPDATE (72 HOURS) ---
 def sync_db_to_supabase():
     db_file = "market_data.db"
     if not os.path.exists(db_file): return
     try:
-        print(f"🔄 Processing DB Clean: {datetime.datetime.now()}")
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
-        # Clean tables based on your database structure
+        # Clean tables for Android Search
         cursor.execute("DROP TABLE IF EXISTS crypto_live")
         cursor.execute("CREATE TABLE crypto_live AS SELECT symbol, 'CRYPTO' as exch_seg FROM crypto")
         cursor.execute("DROP TABLE IF EXISTS forex_live")
@@ -40,93 +39,79 @@ def sync_db_to_supabase():
         with open(db_file, "rb") as f:
             headers = {"Authorization": f"Bearer {SUPABASE_KEY}", "apikey": SUPABASE_KEY, "Content-Type": "application/octet-stream", "x-upsert": "true"}
             requests.post(SUPABASE_DB_URL, headers=headers, data=f)
-            print("🚀 Supabase Upload Success (72h Cycle)")
+            print("🚀 Supabase Upload Success")
     except Exception as e: print(f"❌ DB Sync Error: {e}")
 
-# --- 3. PRICE UPDATE LOGIC ---
+# --- 3. PRICE UPDATE LOGIC (Firebase Writes) ---
 def update_firebase(symbol, price):
     try:
+        # Gold fix: Agar Binance se PAXG aa raha hai toh use XAU dikhao
+        display_symbol = "XAU" if "PAXG" in symbol.upper() else symbol.upper()
+        
         p_str = "{:.2f}".format(float(price))
         time_str = datetime.datetime.now().strftime("%H:%M:%S")
         updates = {}
-        if symbol in node_references:
-            for node_id in node_references[symbol]:
+        
+        if display_symbol in node_references:
+            for node_id in node_references[display_symbol]:
                 updates[f"forex_watchlist/{node_id}/price"] = p_str
                 updates[f"forex_watchlist/{node_id}/utime"] = time_str
-        if updates: db.reference().update(updates)
+        
+        if updates:
+            db.reference().update(updates)
     except: pass
 
-# --- 4. BINANCE ENGINE (BATCHING & DOUBLE-SUB PREVENTION) ---
+# --- 4. BINANCE ENGINE (FREE CRYPTO & GOLD) ---
 def start_binance():
-    global node_references, active_crypto_subs
+    global node_references
     while True:
         try:
+            # Step 1: Firebase se list fetch karo
             data = db.reference('forex_watchlist').get() or {}
             current_symbols = set()
             temp_refs = {}
 
-            for k, v in data.items():
-                sym = v.get('symbol', '').upper().replace('_', '')
-                if 'USD' in sym: # Crypto Filter
-                    clean_sym = sym.lower()
-                    current_symbols.add(clean_sym)
-                    if clean_sym not in temp_refs: temp_refs[clean_sym] = []
-                    temp_refs[clean_sym].append(k)
-            
-            node_references.update(temp_refs)
-            
-            # Batching logic: 100 symbols per stream (Binance limit)
-            symbol_list = list(current_symbols)
-            for i in range(0, len(symbol_list), 100):
-                batch = symbol_list[i:i+100]
-                streams = "/".join([f"{s}@ticker" for s in batch])
-                stream_url = f"wss://stream.binance.com:9443/ws/{streams}"
+            for node_id, fields in data.items():
+                # Symbol clean karo (e.g., "BTCUSDT_userid" -> "BTCUSDT")
+                raw_sym = node_id.split('_')[0].upper()
                 
-                def on_message(ws, msg):
-                    d = json.loads(msg)
-                    update_firebase(d['s'].lower(), d['c'])
+                # Agar XAU (Gold) hai toh Binance ka PAXGUSDT use karo (Free Key)
+                fetch_sym = "PAXGUSDT" if raw_sym == "XAU" else raw_sym
+                
+                if fetch_sym not in temp_refs: temp_refs[fetch_sym] = []
+                temp_refs[fetch_sym].append(node_id)
+                current_symbols.add(fetch_sym.lower())
 
-                ws = websocket.WebSocketApp(stream_url, on_message=on_message)
-                eventlet.spawn(ws.run_forever)
-                print(f"📡 Subscribed to Crypto Batch: {len(batch)} tokens")
+            node_references = temp_refs
             
-            eventlet.sleep(300) # Re-check watchlist every 5 mins
-        except Exception as e:
-            print(f"Binance Error: {e}")
-            eventlet.sleep(10)
+            if not current_symbols:
+                eventlet.sleep(10); continue
 
-# --- 5. TIINGO ENGINE (FOREX) ---
-def start_tiingo():
-    while True:
-        try:
-            ws_url = "wss://api.tiingo.com/fx"
-            def on_open(ws):
-                ws.send(json.dumps({
-                    "eventName": "subscribe",
-                    "authorization": TIINGO_API_KEY,
-                    "eventData": {"thresholdLevel": 5}
-                }))
+            # Step 2: WebSocket Connection
+            streams = "/".join([f"{s}@ticker" for s in current_symbols])
+            url = f"wss://stream.binance.com:9443/ws/{streams}"
+            
             def on_message(ws, msg):
                 d = json.loads(msg)
-                if d.get('messageType') == 'A':
-                    update_firebase(d['data'][0].upper(), d['data'][4])
+                update_firebase(d['s'], d['c'])
 
-            ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message)
+            ws = websocket.WebSocketApp(url, on_message=on_message)
+            print(f"📡 Binance Subscribed: {list(current_symbols)}")
             ws.run_forever()
-        except: eventlet.sleep(5)
+        except: 
+            eventlet.sleep(5)
 
-# --- 6. SCHEDULER & FLASK ---
+# --- 5. SCHEDULER & FLASK ---
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=sync_db_to_supabase, trigger="interval", hours=72)
 scheduler.start()
 
 @app.route('/')
-def health(): return "LIVE_TRADING_SERVER_ACTIVE"
+def health(): return "SYSTEM_LIVE_FIREBASE_CONNECTED"
 
 if __name__ == '__main__':
-    sync_db_to_supabase() # Immediate sync on start
+    sync_db_to_supabase()
     eventlet.spawn(start_binance)
-    eventlet.spawn(start_tiingo)
     port = int(os.environ.get("PORT", 10000))
     import eventlet.wsgi
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
