@@ -14,7 +14,7 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
 
 app = Flask(__name__)
-active_binance_symbols = []
+active_symbols = []
 exotic_list = []
 node_map = {}
 is_forex_open = True
@@ -25,7 +25,6 @@ def check_market_status():
     while True:
         now = datetime.datetime.now(datetime.timezone.utc)
         weekday = now.weekday() 
-        # Forex logic: Closed Fri 22:00 UTC to Sun 22:00 UTC
         if weekday == 5 or (weekday == 4 and now.hour >= 22) or (weekday == 6 and now.hour < 22):
             is_forex_open = False
         else:
@@ -49,32 +48,25 @@ def run_exotic_engine():
                         updates[f"forex_watchlist/{nid}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
                 if updates: 
                     db.reference().update(updates)
-                    print(f"✅ {len(updates)} Exotic Pairs Updated.")
             except Exception as e:
                 print(f"❌ Exotic Error: {e}")
         time.sleep(60)
 
-# --- 4. LOGIC: MASTER ENGINE (REST POLLING) ---
-# Replaced WebSocket with REST to bypass "451 Restricted Location" errors on Render
+# --- 4. LOGIC: MASTER ENGINE (NON-BLOCKING API) ---
 def run_master_engine():
-    global node_map, active_binance_symbols, exotic_list
+    global node_map, active_symbols, exotic_list
     while True:
         try:
             watchlist = db.reference('forex_watchlist').get() or {}
-            new_binance = []
+            new_crypto = []
             new_exotic = []
             new_map = {}
 
             for node_id in watchlist.keys():
                 raw = node_id.split('_')[0].upper()
-                
-                # ROUTING: Crypto (USDT) and Majors/Metals go to Binance REST
                 if "USDT" in raw or any(x in raw for x in ["EUR", "GBP", "JPY", "XAU", "XAG"]):
-                    target = raw
-                    if "USD" in target and "USDT" not in target:
-                        target = target.replace("USD", "USDT")
-                    
-                    new_binance.append(target)
+                    target = raw if "USDT" in raw else raw.replace("USD", "USDT")
+                    new_crypto.append(target)
                     if target not in new_map: new_map[target] = []
                     new_map[target].append(node_id)
                 else:
@@ -82,41 +74,42 @@ def run_master_engine():
 
             exotic_list = new_exotic
             node_map = new_map
-            active_binance_symbols = list(set(new_binance))
+            active_symbols = list(set(new_crypto))
 
-            if active_binance_symbols:
-                # Use the ticker price endpoint - usually not region-blocked like the WebSocket
-                resp = requests.get("https://api.binance.com/api/v3/ticker/24hr")
+            if active_symbols:
+                # Using KuCoin API as it is generally NOT restricted on Render/Cloud IPs
+                resp = requests.get("https://api.kucoin.com/api/v1/market/allTickers")
                 if resp.status_code == 200:
-                    data = resp.json()
-                    # Convert list to dict for fast lookup
-                    price_dict = {item['symbol']: item for item in data}
+                    data = resp.json().get('data', {}).get('ticker', [])
+                    # KuCoin uses hyphen format: BTC-USDT
+                    price_dict = {item['symbol'].replace("-", ""): item for item in data}
                     
                     updates = {}
-                    for sym in active_binance_symbols:
+                    for sym in active_symbols:
                         if sym in price_dict:
                             item = price_dict[sym]
-                            price = item['lastPrice']
-                            p_change = item['priceChangePercent']
+                            price = item['last']
+                            # KuCoin change calculation
+                            change = float(item.get('changeRate', 0)) * 100
                             
                             for nid in node_map.get(sym, []):
                                 updates[f"forex_watchlist/{nid}/price"] = "{:.5f}".format(float(price))
-                                updates[f"forex_watchlist/{nid}/percent"] = f"{p_change}%"
+                                updates[f"forex_watchlist/{nid}/percent"] = "{:.2f}%".format(change)
                                 updates[f"forex_watchlist/{nid}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
                     
                     if updates:
                         db.reference().update(updates)
-                        print(f"📊 Updated {len(active_binance_symbols)} Binance symbols via REST")
+                        print(f"🚀 Updated {len(active_symbols)} symbols via KuCoin API")
                 else:
-                    print(f"⚠️ Binance REST Error: {resp.status_code}")
+                    print(f"⚠️ KuCoin API Error: {resp.status_code}")
 
-            time.sleep(10) # 10 second refresh rate
+            time.sleep(15)
         except Exception as e:
             print(f"❌ Master Engine Error: {e}")
             time.sleep(5)
 
 @app.route('/')
-def health(): return "HYBRID_ENGINE_V3_REST_ACTIVE"
+def health(): return "HYBRID_ENGINE_V4_KUCOIN_ACTIVE"
 
 if __name__ == '__main__':
     threading.Thread(target=check_market_status, daemon=True).start()
