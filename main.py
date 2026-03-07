@@ -4,10 +4,11 @@ import os, datetime, json, firebase_admin, websocket, time, threading, sqlite3, 
 from firebase_admin import credentials, db
 from flask import Flask
 
-# --- CONFIG ---
+# --- 1. CONFIG & AUTH ---
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co/storage/v1/object/public/Myt/market_data.db"
+# Aapki verified Exotic API Key
 FOREX_API_KEY = "8bc2800bcaaa268f50b12fa2" 
 
 if not firebase_admin._apps:
@@ -21,39 +22,26 @@ node_map = {}
 current_ws = None
 is_forex_open = True
 
-# --- LOGIC: MARKET STATUS (Forex Only) ---
+# --- 2. LOGIC: FOREX MARKET STATUS ---
 def check_market_status():
     global is_forex_open
     while True:
         now = datetime.datetime.now(datetime.timezone.utc)
-        weekday = now.weekday() # 5=Sat, 6=Sun
-        # Forex closes Friday 22:00 UTC and opens Sunday 22:00 UTC
+        weekday = now.weekday() 
+        # Forex logic: Closed from Fri 22:00 UTC to Sun 22:00 UTC
         if weekday == 5 or (weekday == 4 and now.hour >= 22) or (weekday == 6 and now.hour < 22):
             is_forex_open = False
         else:
             is_forex_open = True
         time.sleep(300)
 
-# --- LOGIC: AUTO-SYNC ---
-def auto_sync_scheduler():
-    while True:
-        now = datetime.datetime.now()
-        if now.hour == 5 and now.minute == 0:
-            try:
-                r = requests.get(SUPABASE_URL, timeout=60)
-                with open("market_data.db", "wb") as f: f.write(r.content)
-                gc.collect()
-            except: pass
-            time.sleep(70)
-        time.sleep(30)
-
-# --- LOGIC: EXOTIC (AFGHANI ETC) ---
+# --- 3. LOGIC: EXOTIC UPDATER (AFGHANI ETC) ---
 def run_exotic_engine():
     global exotic_list, is_forex_open
     while True:
-        # Exotic pairs follow Forex market hours
         if is_forex_open and exotic_list:
             try:
+                # API Key use karke exotic rates fetch
                 resp = requests.get(f"https://v6.exchangerate-api.com/v6/{FOREX_API_KEY}/latest/USD")
                 rates = resp.json().get('conversion_rates', {})
                 updates = {}
@@ -67,7 +55,7 @@ def run_exotic_engine():
             except: pass
         time.sleep(60)
 
-# --- LOGIC: LIVE BINANCE (CRYPTO 24/7) ---
+# --- 4. LOGIC: BINANCE ENGINE (CRYPTO 24/7) ---
 def run_master_engine():
     global node_map, current_ws, active_binance, exotic_list
     while True:
@@ -79,7 +67,7 @@ def run_master_engine():
 
             for node_id in watchlist.keys():
                 raw = node_id.split('_')[0].upper()
-                # Majors/Crypto handle via Binance
+                # Binance Routing for Majors and Crypto
                 if any(x in raw for x in ["BTC", "ETH", "EUR", "GBP", "JPY", "XAU"]):
                     target = raw.lower().replace("usd", "usdt")
                     new_binance.add(target)
@@ -112,13 +100,14 @@ def run_master_engine():
         except: time.sleep(5)
 
 @app.route('/')
-def health(): return "SYSTEM_STABLE_V3"
+def health(): return "HYBRID_ENGINE_V3_READY"
 
 if __name__ == '__main__':
+    # Start Background Threads
     threading.Thread(target=check_market_status, daemon=True).start()
-    threading.Thread(target=auto_sync_scheduler, daemon=True).start()
     threading.Thread(target=run_exotic_engine, daemon=True).start()
     threading.Thread(target=run_master_engine, daemon=True).start()
     
+    # Render Production Port
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
