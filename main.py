@@ -1,111 +1,116 @@
 import eventlet
 eventlet.monkey_patch()
-import os, datetime, json, firebase_admin, websocket, time, threading, sqlite3, requests
+import os, datetime, json, firebase_admin, websocket, time, threading, sqlite3, requests, gc
 from firebase_admin import credentials, db
 from flask import Flask
 
-# --- 1. CONFIGURATION ---
+# --- CONFIG ---
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
-# Aapki Supabase DB URL jahan se symbols ki list aayegi
-SUPABASE_DB_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co/storage/v1/object/public/Myt/market_data.db"
+SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co/storage/v1/object/public/Myt/market_data.db"
+# Aapki New API Key mix kar di gayi hai
+FOREX_API_KEY = "8bc2800bcaaa268f50b12fa2" 
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(KEY_FILE)
     firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
 
 app = Flask(__name__)
+active_binance = set()
+exotic_list = []
 node_map = {}
+last_data = {}
 current_ws = None
+is_market_open = True
 
-# --- 2. AUTO-DOWNLOAD DATABASE ---
-def download_latest_symbols():
-    try:
-        print("📥 Downloading latest symbol database from Supabase...")
-        r = requests.get(SUPABASE_DB_URL)
-        with open("market_data.db", "wb") as f:
-            f.write(r.content)
-        print("✅ Database updated successfully!")
-    except Exception as e:
-        print(f"❌ Download Error: {e}")
-
-# --- 3. PRICE UPDATER ---
-def update_firebase(binance_sym, price):
-    global node_map
-    try:
-        incoming_sym = binance_sym.upper()
-        p_str = "{:.2f}".format(float(price))
-        time_str = datetime.datetime.now().strftime("%H:%M:%S")
-        
-        # Mapping for your app's specific names
-        rev_map = {"PAXGUSDT": "XAU", "EURUSDT": "EURUSD", "GBPUSDT": "GBPUSD"}
-        target_key = rev_map.get(incoming_sym, incoming_sym)
-
-        if target_key in node_map:
-            updates = {}
-            for node_id in node_map[target_key]:
-                updates[f"forex_watchlist/{node_id}/price"] = p_str
-                updates[f"forex_watchlist/{node_id}/utime"] = time_str
-            if updates:
-                db.reference().update(updates)
-    except: pass
-
-# --- 4. BINANCE ENGINE ---
-def run_ws():
-    global node_map, current_ws
+# --- LOGIC: AUTO-SYNC (Daily 05:00 AM) ---
+def auto_sync_scheduler():
     while True:
+        now = datetime.datetime.now()
+        if now.hour == 5 and now.minute == 0:
+            try:
+                r = requests.get(SUPABASE_URL, timeout=60)
+                with open("market_data.db", "wb") as f: f.write(r.content)
+                gc.collect()
+                print("✅ Daily Sync Complete.")
+            except: pass
+            time.sleep(70)
+        time.sleep(30)
+
+# --- LOGIC: EXOTIC UPDATER (For Afghani etc.) ---
+def run_exotic_engine():
+    global exotic_list, is_market_open
+    while True:
+        if is_market_open and exotic_list:
+            try:
+                # USD Base par saare rates fetch karega
+                resp = requests.get(f"https://v6.exchangerate-api.com/v6/{FOREX_API_KEY}/latest/USD")
+                data = resp.json()
+                if data['result'] == 'success':
+                    rates = data['conversion_rates']
+                    updates = {}
+                    for nid in exotic_list:
+                        sym = nid.split('_')[0].upper().replace("USD", "")
+                        if sym in rates:
+                            price = 1 / rates[sym] # Inverse for USD/Pair
+                            updates[f"forex_watchlist/{nid}/price"] = "{:.5f}".format(price)
+                            updates[f"forex_watchlist/{nid}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
+                    db.reference().update(updates)
+            except: pass
+        time.sleep(60) # Exotic pairs 1 min mein ek baar kaafi hain
+
+# --- LOGIC: LIVE BINANCE ENGINE ---
+def run_master_engine():
+    global node_map, current_ws, active_binance, exotic_list, is_market_open
+    while True:
+        if not is_market_open:
+            time.sleep(10); continue
         try:
-            data = db.reference('forex_watchlist').get() or {}
-            subs = set()
+            watchlist = db.reference('forex_watchlist').get() or {}
+            new_binance = set()
+            new_exotic = []
             new_map = {}
 
-            for node_id in data.keys():
-                # Extracting symbol (e.g., BTCUSDT from BTCUSDT_user123)
-                sym = node_id.split('_')[0].upper()
-                if sym not in new_map: new_map[sym] = []
-                new_map[sym].append(node_id)
-                
-                # Format for Binance subscription
-                b_pair = sym.lower()
-                if sym == "XAU": b_pair = "paxgusdt"
-                elif "USD" in sym and len(sym) == 6: b_pair = sym.lower().replace("usd", "usdt")
-                subs.add(b_pair)
+            # Routing Logic
+            for node_id in watchlist.keys():
+                raw = node_id.split('_')[0].upper()
+                # Check if it's a Major/Crypto for Binance
+                if any(x in raw for x in ["BTC", "ETH", "EUR", "GBP", "JPY", "XAU"]):
+                    target = raw.lower().replace("usd", "usdt")
+                    new_binance.add(target)
+                    if target.upper() not in new_map: new_map[target.upper()] = []
+                    new_map[target.upper()].append(node_id)
+                else:
+                    new_exotic.append(node_id)
 
-            node_map = new_map
-            if subs:
-                streams = "/".join([f"{s}@ticker" for s in subs])
-                url = f"wss://stream.binance.com:9443/ws/{streams}"
-
-                def on_message(ws, msg):
-                    d = json.loads(msg)
-                    if 's' in d and 'c' in d: update_firebase(d['s'], d['c'])
-
-                current_ws = websocket.WebSocketApp(url, on_message=on_message)
-                print(f"⚡ Live Monitoring: {list(subs)}")
-                current_ws.run_forever()
-            time.sleep(5)
+            exotic_list = new_exotic
+            if new_binance != active_binance:
+                active_binance = new_binance
+                node_map = new_map
+                if current_ws: current_ws.close()
+                if active_binance:
+                    url = f"wss://stream.binance.com:9443/ws/{'/'.join([f'{s}@ticker' for s in active_binance])}"
+                    def on_message(ws, msg):
+                        d = json.loads(msg)
+                        if 's' in d and 'c' in d:
+                            s_id, price, p_change = d['s'].upper(), d['c'], d['P']
+                            updates = {}
+                            for nid in node_map.get(s_id, []):
+                                updates[f"forex_watchlist/{nid}/price"] = "{:.5f}".format(float(price))
+                                updates[f"forex_watchlist/{nid}/percent"] = f"{p_change}%"
+                                updates[f"forex_watchlist/{nid}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
+                            db.reference().update(updates)
+                    current_ws = websocket.WebSocketApp(url, on_message=on_message)
+                    threading.Thread(target=current_ws.run_forever).start()
+            time.sleep(15)
         except: time.sleep(5)
 
-# --- 5. SYNC CHECKER ---
-def sync_checker():
-    global current_ws
-    last_count = 0
-    while True:
-        try:
-            data = db.reference('forex_watchlist').get() or {}
-            if len(data) != last_count:
-                if current_ws: current_ws.close()
-                last_count = len(data)
-        except: pass
-        time.sleep(20)
-
 @app.route('/')
-def health(): return "AUTO_SYNC_DOWNLOAD_ACTIVE"
+def health(): return "HYBRID_ENGINE_V1_READY"
 
 if __name__ == '__main__':
-    download_latest_symbols() # Deploy hote hi naye symbols download karo
-    threading.Thread(target=run_ws, daemon=True).start()
-    threading.Thread(target=sync_checker, daemon=True).start()
+    threading.Thread(target=auto_sync_scheduler, daemon=True).start()
+    threading.Thread(target=run_exotic_engine, daemon=True).start()
+    threading.Thread(target=run_master_engine, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
-    import eventlet.wsgi
     eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
