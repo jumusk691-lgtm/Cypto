@@ -1,13 +1,12 @@
 import eventlet
 eventlet.monkey_patch()
-import os, datetime, json, firebase_admin, websocket, time, threading, sqlite3, requests, gc
+import os, datetime, json, firebase_admin, time, threading, requests
 from firebase_admin import credentials, db
 from flask import Flask
 
 # --- 1. CONFIG & AUTH ---
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
-# Aapki verified Exotic API Key
 FOREX_API_KEY = "8bc2800bcaaa268f50b12fa2" 
 
 if not firebase_admin._apps:
@@ -15,10 +14,9 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
 
 app = Flask(__name__)
-active_binance = set()
+active_binance_symbols = []
 exotic_list = []
 node_map = {}
-current_ws = None
 is_forex_open = True
 
 # --- 2. LOGIC: FOREX MARKET STATUS ---
@@ -27,7 +25,7 @@ def check_market_status():
     while True:
         now = datetime.datetime.now(datetime.timezone.utc)
         weekday = now.weekday() 
-        # Forex logic: Closed from Fri 22:00 UTC to Sun 22:00 UTC
+        # Forex logic: Closed Fri 22:00 UTC to Sun 22:00 UTC
         if weekday == 5 or (weekday == 4 and now.hour >= 22) or (weekday == 6 and now.hour < 22):
             is_forex_open = False
         else:
@@ -44,7 +42,6 @@ def run_exotic_engine():
                 rates = resp.json().get('conversion_rates', {})
                 updates = {}
                 for nid in exotic_list:
-                    # Example: "AFNUSD_uid" -> "AFN"
                     sym = nid.split('_')[0].upper().replace("USD", "")
                     if sym in rates:
                         price = 1 / rates[sym]
@@ -57,81 +54,74 @@ def run_exotic_engine():
                 print(f"❌ Exotic Error: {e}")
         time.sleep(60)
 
-# --- 4. LOGIC: MASTER ENGINE (BINANCE + AUTO-DETECTION) ---
+# --- 4. LOGIC: MASTER ENGINE (REST POLLING) ---
+# Replaced WebSocket with REST to bypass "451 Restricted Location" errors on Render
 def run_master_engine():
-    global node_map, current_ws, active_binance, exotic_list
+    global node_map, active_binance_symbols, exotic_list
     while True:
         try:
             watchlist = db.reference('forex_watchlist').get() or {}
-            new_binance = set()
+            new_binance = []
             new_exotic = []
             new_map = {}
 
             for node_id in watchlist.keys():
                 raw = node_id.split('_')[0].upper()
                 
-                # --- AUTO ROUTING LOGIC ---
-                # 1. Any symbol with "USDT" (e.g., BTSUSDT, BTTCUSDT)
-                # 2. Majors and Gold/Silver
+                # ROUTING: Crypto (USDT) and Majors/Metals go to Binance REST
                 if "USDT" in raw or any(x in raw for x in ["EUR", "GBP", "JPY", "XAU", "XAG"]):
-                    # Binance mapping (ensure usdt format)
-                    target = raw.lower()
-                    if "usd" in target and "usdt" not in target:
-                        target = target.replace("usd", "usdt")
+                    target = raw
+                    if "USD" in target and "USDT" not in target:
+                        target = target.replace("USD", "USDT")
                     
-                    new_binance.add(target)
-                    if target.upper() not in new_map: new_map[target.upper()] = []
-                    new_map[target.upper()].append(node_id)
+                    new_binance.append(target)
+                    if target not in new_map: new_map[target] = []
+                    new_map[target].append(node_id)
                 else:
                     new_exotic.append(node_id)
 
             exotic_list = new_exotic
-            
-            # Restart WS only if targets changed
-            if new_binance != active_binance:
-                print(f"🔄 Watchlist Change Detected. Updating Stream: {new_binance}")
-                active_binance = new_binance
-                node_map = new_map
-                if current_ws: 
-                    current_ws.close()
-                
-                if active_binance:
-                    url = f"wss://stream.binance.com:9443/ws/{'/'.join([f'{s}@ticker' for s in active_binance])}"
+            node_map = new_map
+            active_binance_symbols = list(set(new_binance))
+
+            if active_binance_symbols:
+                # Use the ticker price endpoint - usually not region-blocked like the WebSocket
+                resp = requests.get("https://api.binance.com/api/v3/ticker/24hr")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # Convert list to dict for fast lookup
+                    price_dict = {item['symbol']: item for item in data}
                     
-                    def on_message(ws, msg):
-                        d = json.loads(msg)
-                        if 's' in d and 'c' in d:
-                            s_id, price, p_change = d['s'].upper(), d['c'], d['P']
-                            updates = {}
-                            for nid in node_map.get(s_id, []):
+                    updates = {}
+                    for sym in active_binance_symbols:
+                        if sym in price_dict:
+                            item = price_dict[sym]
+                            price = item['lastPrice']
+                            p_change = item['priceChangePercent']
+                            
+                            for nid in node_map.get(sym, []):
                                 updates[f"forex_watchlist/{nid}/price"] = "{:.5f}".format(float(price))
                                 updates[f"forex_watchlist/{nid}/percent"] = f"{p_change}%"
                                 updates[f"forex_watchlist/{nid}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
-                            db.reference().update(updates)
-
-                    def on_error(ws, error): print(f"❌ WS Error: {error}")
-                    def on_close(ws, c, m): print("🔌 WebSocket Connection Closed")
                     
-                    current_ws = websocket.WebSocketApp(url, 
-                                                       on_message=on_message, 
-                                                       on_error=on_error, 
-                                                       on_close=on_close)
-                    threading.Thread(target=current_ws.run_forever, daemon=True).start()
-            
-            time.sleep(15)
+                    if updates:
+                        db.reference().update(updates)
+                        print(f"📊 Updated {len(active_binance_symbols)} Binance symbols via REST")
+                else:
+                    print(f"⚠️ Binance REST Error: {resp.status_code}")
+
+            time.sleep(10) # 10 second refresh rate
         except Exception as e:
             print(f"❌ Master Engine Error: {e}")
             time.sleep(5)
 
 @app.route('/')
-def health(): return "HYBRID_ENGINE_V3_ACTIVE"
+def health(): return "HYBRID_ENGINE_V3_REST_ACTIVE"
 
 if __name__ == '__main__':
-    # Start Services
     threading.Thread(target=check_market_status, daemon=True).start()
     threading.Thread(target=run_exotic_engine, daemon=True).start()
     threading.Thread(target=run_master_engine, daemon=True).start()
     
-    # Run Flask
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
