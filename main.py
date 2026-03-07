@@ -8,7 +8,6 @@ from flask import Flask
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
 SUPABASE_URL = "https://tnrhlvibaeiwhlrxdxnm.supabase.co/storage/v1/object/public/Myt/market_data.db"
-# Aapki New API Key mix kar di gayi hai
 FOREX_API_KEY = "8bc2800bcaaa268f50b12fa2" 
 
 if not firebase_admin._apps:
@@ -19,9 +18,20 @@ app = Flask(__name__)
 active_binance = set()
 exotic_list = []
 node_map = {}
-last_data = {}
 current_ws = None
 is_market_open = True
+
+# --- LOGIC: MARKET STATUS (Mon-Fri) ---
+def check_market_status():
+    global is_market_open
+    while True:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        weekday = now.weekday() # 5=Sat, 6=Sun
+        if weekday >= 5:
+            is_market_open = False
+        else:
+            is_market_open = True
+        time.sleep(600)
 
 # --- LOGIC: AUTO-SYNC (Daily 05:00 AM) ---
 def auto_sync_scheduler():
@@ -37,27 +47,24 @@ def auto_sync_scheduler():
             time.sleep(70)
         time.sleep(30)
 
-# --- LOGIC: EXOTIC UPDATER (For Afghani etc.) ---
+# --- LOGIC: EXOTIC UPDATER (Afghani etc.) ---
 def run_exotic_engine():
     global exotic_list, is_market_open
     while True:
         if is_market_open and exotic_list:
             try:
-                # USD Base par saare rates fetch karega
                 resp = requests.get(f"https://v6.exchangerate-api.com/v6/{FOREX_API_KEY}/latest/USD")
-                data = resp.json()
-                if data['result'] == 'success':
-                    rates = data['conversion_rates']
-                    updates = {}
-                    for nid in exotic_list:
-                        sym = nid.split('_')[0].upper().replace("USD", "")
-                        if sym in rates:
-                            price = 1 / rates[sym] # Inverse for USD/Pair
-                            updates[f"forex_watchlist/{nid}/price"] = "{:.5f}".format(price)
-                            updates[f"forex_watchlist/{nid}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
-                    db.reference().update(updates)
+                rates = resp.json().get('conversion_rates', {})
+                updates = {}
+                for nid in exotic_list:
+                    sym = nid.split('_')[0].upper().replace("USD", "")
+                    if sym in rates:
+                        price = 1 / rates[sym]
+                        updates[f"forex_watchlist/{nid}/price"] = "{:.5f}".format(price)
+                        updates[f"forex_watchlist/{nid}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
+                db.reference().update(updates)
             except: pass
-        time.sleep(60) # Exotic pairs 1 min mein ek baar kaafi hain
+        time.sleep(60)
 
 # --- LOGIC: LIVE BINANCE ENGINE ---
 def run_master_engine():
@@ -70,11 +77,8 @@ def run_master_engine():
             new_binance = set()
             new_exotic = []
             new_map = {}
-
-            # Routing Logic
             for node_id in watchlist.keys():
                 raw = node_id.split('_')[0].upper()
-                # Check if it's a Major/Crypto for Binance
                 if any(x in raw for x in ["BTC", "ETH", "EUR", "GBP", "JPY", "XAU"]):
                     target = raw.lower().replace("usd", "usdt")
                     new_binance.add(target)
@@ -82,7 +86,6 @@ def run_master_engine():
                     new_map[target.upper()].append(node_id)
                 else:
                     new_exotic.append(node_id)
-
             exotic_list = new_exotic
             if new_binance != active_binance:
                 active_binance = new_binance
@@ -106,11 +109,14 @@ def run_master_engine():
         except: time.sleep(5)
 
 @app.route('/')
-def health(): return "HYBRID_ENGINE_V1_READY"
+def health(): return "HYBRID_ENGINE_V2_READY"
 
 if __name__ == '__main__':
+    threading.Thread(target=check_market_status, daemon=True).start()
     threading.Thread(target=auto_sync_scheduler, daemon=True).start()
     threading.Thread(target=run_exotic_engine, daemon=True).start()
     threading.Thread(target=run_master_engine, daemon=True).start()
+    
+    # Fix for Render Error: Standard app.run instead of eventlet.wsgi
     port = int(os.environ.get("PORT", 10000))
-    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', port)), app)
+    app.run(host='0.0.0.0', port=port)
