@@ -1,14 +1,10 @@
-import eventlet
-eventlet.monkey_patch()
-import os, datetime, json, firebase_admin, websocket, time, threading, requests
+import os, datetime, json, firebase_admin, time, threading, requests
 from firebase_admin import credentials, db
 from flask import Flask
 
 # --- 1. CONFIG ---
 KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
 DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
-# Forex/Metals ke liye Finnhub Free API Key (finnhub.io se turant mil jayegi)
-FINNHUB_KEY = "YOUR_FINNHUB_API_KEY" 
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(KEY_FILE)
@@ -17,79 +13,60 @@ if not firebase_admin._apps:
 app = Flask(__name__)
 node_map = {}
 
-# --- 2. FAST UPDATE FUNCTION ---
-def fast_update(symbol, price, change="0.00%"):
-    updates = {}
-    for nid in node_map.get(symbol.upper(), []):
-        updates[f"forex_watchlist/{nid}/price"] = "{:.5f}".format(float(price))
-        updates[f"forex_watchlist/{nid}/percent"] = change
-        updates[f"forex_watchlist/{nid}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
-    if updates:
-        db.reference().update(updates)
-
-# --- 3. CRYPTO WEBSOCKET (BINANCE US - No Block on Render) ---
-def start_crypto_ws():
-    def on_message(ws, msg):
-        d = json.loads(msg)
-        if 's' in d and 'c' in d:
-            fast_update(d['s'], d['c'], f"{d['P']}%")
-
-    def run():
-        while True:
-            try:
-                # Binance US use kar rahe hain taaki 451 error na aaye
-                active_list = [s.lower() for s in node_map.keys() if "USDT" in s]
-                if active_list:
-                    url = f"wss://stream.binance.us:9443/ws/{'/'.join([f'{s}@ticker' for s in active_list])}"
-                    ws = websocket.WebSocketApp(url, on_message=on_message)
-                    ws.run_forever()
-            except: time.sleep(5)
-    
-    threading.Thread(target=run, daemon=True).start()
-
-# --- 4. FOREX/GOLD WEBSOCKET (FINNHUB) ---
-def start_forex_ws():
-    def on_message(ws, msg):
-        data = json.loads(msg)
-        if data['type'] == 'trade':
-            for trade in data['data']:
-                fast_update(trade['s'], trade['p'])
-
-    def run():
-        while True:
-            try:
-                ws = websocket.WebSocketApp(f"wss://ws.finnhub.io?token={FINNHUB_KEY}",
-                                          on_message=on_message)
-                def on_open(ws):
-                    # Majors aur Gold ke liye subscribe
-                    for s in ["OANDA:XAU_USD", "OANDA:EUR_USD", "OANDA:GBP_USD"]:
-                        ws.send(json.dumps({"type":"subscribe", "symbol": s}))
-                ws.on_open = on_open
-                ws.run_forever()
-            except: time.sleep(5)
-            
-    threading.Thread(target=run, daemon=True).start()
-
-# --- 5. MONITOR WATCHLIST ---
-def monitor_watchlist():
+# --- 2. MASTER ENGINE (1-SECOND POLLING) ---
+def run_fast_engine():
     global node_map
+    print("🚀 Fast Engine Started...")
     while True:
         try:
+            # Watchlist fetch karein
             watchlist = db.reference('forex_watchlist').get() or {}
-            new_map = {}
-            for nid, data in watchlist.items():
+            temp_map = {}
+            for nid in watchlist.keys():
                 sym = nid.split('_')[0].upper()
-                if sym not in new_map: new_map[sym] = []
-                new_map[sym].append(nid)
-            node_map = new_map
-        except: pass
-        time.sleep(30)
+                if sym not in temp_map: temp_map[sym] = []
+                temp_map[sym].append(nid)
+            node_map = temp_map
+
+            if node_map:
+                # KuCoin API 1-second update ke liye sabse best hai
+                resp = requests.get("https://api.kucoin.com/api/v1/market/allTickers", timeout=1)
+                if resp.status_code == 200:
+                    data = resp.json().get('data', {}).get('ticker', [])
+                    # Sabhi symbols ko dictionary mein daalein (Fast lookup)
+                    prices = {item['symbol'].replace("-", ""): item for item in data}
+                    
+                    updates = {}
+                    for sym, nids in node_map.items():
+                        # Binance formats ko match karne ke liye
+                        target = sym if "USDT" in sym else f"{sym}USDT"
+                        
+                        if target in prices:
+                            p_data = prices[target]
+                            for nid in nids:
+                                updates[f"forex_watchlist/{nid}/price"] = "{:.5f}".format(float(p_data['last']))
+                                updates[f"forex_watchlist/{nid}/percent"] = "{:.2f}%".format(float(p_data.get('changeRate', 0)) * 100)
+                                updates[f"forex_watchlist/{nid}/utime"] = datetime.datetime.now().strftime("%H:%M:%S")
+
+                    if updates:
+                        db.reference().update(updates)
+            
+            # EXACT 1 SECOND DELAY
+            time.sleep(1)
+            
+        except Exception as e:
+            print(f"❌ Engine Error: {e}")
+            time.sleep(1)
 
 @app.route('/')
-def health(): return "LIVE_1SEC_ENGINE_ACTIVE"
+def health():
+    return "ENGINE_RUNNING_1SEC"
 
 if __name__ == '__main__':
-    threading.Thread(target=monitor_watchlist, daemon=True).start()
-    start_crypto_ws()
-    # start_forex_ws() # Finnhub key daalne ke baad ise uncomment karein
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    # Engine ko separate thread mein chalayein
+    t = threading.Thread(target=run_fast_engine, daemon=True)
+    t.start()
+    
+    # Render port fix
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
