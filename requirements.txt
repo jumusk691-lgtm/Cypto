@@ -9,3 +9,4 @@ python-engineio>=4.8.0
 websocket-client
 apscheduler
 yfinance
+flask-socketio
