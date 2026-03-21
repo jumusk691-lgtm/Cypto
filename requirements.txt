@@ -1,5 +1,4 @@
 gunicorn
-flask
 firebase-admin
 requests
 eventlet==0.35.2
