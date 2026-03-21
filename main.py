@@ -1,117 +1,92 @@
-import os, datetime, json, firebase_admin, time, threading, requests
-from firebase_admin import credentials, db
-from flask import Flask
+import eventlet
+eventlet.monkey_patch()
+
+import os, time, requests, threading
+from flask import Flask, jsonify, request
+from flask_socketio import SocketIO, emit
 
 # --- 1. CONFIGURATION ---
-KEY_FILE = "trade-f600a-firebase-adminsdk-fbsvc-269ab50c0c.json"
-DB_URL = 'https://trade-f600a-default-rtdb.firebaseio.com/'
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate(KEY_FILE)
-    firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
+FINNHUB_KEY = "d6vag8hr01qiiutb3j9gd6vag8hr01qiiutb3ja0"
 
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# Global state
-node_map = {}
-last_data_cache = {}
+# Global RAM state (Database ki jagah RAM use karenge fast speed ke liye)
+master_symbol_list = [] # Search ke liye
+subscribed_symbols = {} # { 'OANDA:EUR_USD': last_active_time }
+price_cache = {}        # { 'OANDA:EUR_USD': {'p': '1.08542'} }
 
-# --- 2. DYNAMIC WATCHLIST LISTENER ---
-def start_forex_listener():
-    """Firebase se live symbols load karta hai"""
-    global node_map
-    def listener_callback(event):
-        global node_map
-        watchlist = db.reference('forex_watchlist').get() or {}
-        temp_map = {}
-        for nid in watchlist.keys():
-            # 'AED_b02Oy...' se 'AED' nikalna
-            sym = nid.split('_')[0].upper()
-            if sym not in temp_map: 
-                temp_map[sym] = []
-            temp_map[sym].append(nid)
-        node_map = temp_map
-        print(f"📡 Forex Watchlist Updated: {list(node_map.keys())}")
+# ==============================================================================
+# 2. MASTER SYMBOL DOWNLOAD (One-time)
+# ==============================================================================
+def download_master_symbols():
+    """Finnhub se saare symbols RAM mein load karta hai (Search ke liye)"""
+    global master_symbol_list
+    print("🚀 Downloading Master Symbols from Finnhub...")
+    try:
+        # Forex (OANDA) & Crypto (Binance)
+        f_data = requests.get(f"https://finnhub.io/api/v1/forex/symbol?exchange=oanda&token={FINNHUB_KEY}").json()
+        c_data = requests.get(f"https://finnhub.io/api/v1/crypto/symbol?exchange=binance&token={FINNHUB_KEY}").json()
+        
+        master_symbol_list = [{"s": i['symbol'], "d": i['displaySymbol']} for i in f_data + c_data]
+        print(f"✅ {len(master_symbol_list)} Symbols loaded in RAM.")
+    except Exception as e:
+        print(f"❌ Load Error: {e}")
 
-    # Initial load + Listen for changes
-    db.reference('forex_watchlist').listen(listener_callback)
+# ==============================================================================
+# 3. SEARCH & LIVE ENGINE
+# ==============================================================================
+@app.route('/api/search', methods=['POST'])
+def search():
+    query = request.json.get('query', '').upper()
+    results = [s for s in master_symbol_list if query in s['d'].upper()][:20]
+    return jsonify(results)
 
-# --- 3. IMPROVED UPDATE LOGIC ---
-def fast_update(raw_symbol, price, change="0.00"):
-    global last_data_cache
-    updates = {}
-    
-    # FIX: KuCoin 'BTC-USDT' ya 'AED-USDT' ko 'BTC' ya 'AED' banata hai
-    clean_sym = raw_symbol.split('-')[0].upper()
-    
-    if clean_sym in node_map:
+def fetch_batch(batch):
+    """Finnhub API Pulse"""
+    for sym in batch:
         try:
-            current_price = float(price)
-            
-            # Optimization: Price badle tabhi update karein
-            if last_data_cache.get(clean_sym) == current_price:
-                return
+            url = f"https://finnhub.io/api/v1/quote?symbol={sym}&token={FINNHUB_KEY}"
+            res = requests.get(url, timeout=1.5).json()
+            if res.get('c'):
+                price_cache[sym] = {"s": sym, "p": "{:.5f}".format(res['c']), "t": time.time()}
+        except: continue
 
-            now_time = datetime.datetime.now().strftime("%H:%M:%S")
-            
-            for nid in node_map[clean_sym]:
-                path = f"forex_watchlist/{nid}"
-                # 5 decimal places tak update (Forex ke liye zaroori)
-                updates[f"{path}/price"] = "{:.5f}".format(current_price)
-                updates[f"{path}/percent"] = f"{change}%"
-                updates[f"{path}/utime"] = now_time
-                
-            if updates:
-                db.reference().update(updates)
-                last_data_cache[clean_sym] = current_price
-                # Debugging ke liye log (Check karein Render logs mein)
-                print(f"✅ Live Update: {clean_sym} -> {current_price}")
-                
-        except Exception as e:
-            print(f"❌ Update Error for {clean_sym}: {e}")
-
-# --- 4. OPTIMIZED ENGINE ---
-def run_forex_engine():
-    print("💎 Forex/Crypto Engine Running...")
+def run_global_engine():
     while True:
-        try:
-            # KuCoin API - Best for Render (No Block)
-            resp = requests.get("https://api.kucoin.com/api/v1/market/allTickers", timeout=10)
-            if resp.status_code == 200:
-                tickers = resp.json().get('data', {}).get('ticker', [])
-                
-                for t in tickers:
-                    s = t.get('symbol') # e.g., 'AED-USDT'
-                    p = t.get('last')   # Price
-                    c = t.get('changeRate', '0.00')
-                    
-                    if s and p:
-                        fast_update(s, p, c)
+        active = list(subscribed_symbols.keys())
+        if active:
+            # Batching 50 (Point 5)
+            for i in range(0, len(active), 50):
+                threading.Thread(target=fetch_batch, args=(active[i:i+50],)).start()
             
-            # 1-2 second ka gap zaroori hai
-            time.sleep(1.5)
-            
-        except Exception as e:
-            print(f"⚠️ Network/API Error: {e}")
-            time.sleep(5)
+            # Ek saath live update (Point 6)
+            socketio.emit('live_ticks', price_cache)
+        eventlet.sleep(1.5)
 
-# --- 5. HEALTH CHECK ---
-@app.route('/')
-def health():
-    # Render ko batata hai ki engine active hai
-    return {
-        "status": "stable",
-        "tracked_symbols": list(node_map.keys()),
-        "last_sync": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
+# ==============================================================================
+# 4. SOCKET EVENTS & CLEANUP
+# ==============================================================================
+@socketio.on('subscribe')
+def on_sub(data):
+    sym = data.get('symbol')
+    if sym:
+        subscribed_symbols[sym] = time.time()
+        if sym in price_cache: emit('instant_price', price_cache[sym])
+
+def janitor():
+    """5-sec Cleanup (Point 7)"""
+    while True:
+        now = time.time()
+        expired = [s for s, t in subscribed_symbols.items() if now - t > 10]
+        for s in expired:
+            subscribed_symbols.pop(s, None)
+            price_cache.pop(s, None)
+        eventlet.sleep(5)
 
 if __name__ == '__main__':
-    # Listener start karein
-    threading.Thread(target=start_forex_listener, daemon=True).start()
-    
-    # Engine start karein
-    threading.Thread(target=run_forex_engine, daemon=True).start()
-    
-    # Port binding for Render
+    download_master_symbols()
+    socketio.start_background_task(run_global_engine)
+    socketio.start_background_task(janitor)
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    socketio.run(app, host='0.0.0.0', port=port)
