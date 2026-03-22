@@ -1,5 +1,5 @@
 import eventlet
-eventlet.monkey_patch() # Sabse upar hona chahiye crash se bachne ke liye
+eventlet.monkey_patch()
 
 import os
 import time
@@ -7,23 +7,19 @@ import sqlite3
 import requests
 import json
 import traceback
-from flask import Flask, jsonify, request
-from flask_socketio import SocketIO, emit, join_room
-from websocket import create_connection # pip install websocket-client
+from flask import Flask, jsonify
+from flask_socketio import SocketIO, join_room
+from websocket import create_connection
 
 app = Flask(__name__)
 
-# ==============================================================================
-# --- 1. SOCKET CONFIGURATION (BUFFER FIX) ---
-# ==============================================================================
-# max_http_buffer_size ko 50MB rakha hai taaki "Too many packets" error na aaye
+# --- 1. SOCKET CONFIG ---
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
     async_mode='eventlet',
-    ping_timeout=120,
-    ping_interval=40,
-    max_http_buffer_size=50000000 
+    ping_timeout=60,
+    max_http_buffer_size=100000000 # 100MB buffer for large watchlists
 )
 
 # --- CONFIGURATION ---
@@ -35,34 +31,25 @@ DB_FILE = "market_data.db"
 
 price_cache = {}
 subscribed_symbols = set()
+last_emit_time = 0
 
-# --- 2. SYNC LOGIC ---
-def sync_db_from_supabase():
-    url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{DB_FILE}"
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code == 200:
-            with open(DB_FILE, "wb") as f:
-                f.write(r.content)
-            print("✅ Database Synced from Cloud")
-            return True
-    except Exception as e:
-        print(f"❌ Sync Error: {e}")
-    return False
-
-# --- 3. SYMBOL FORMATTER (Fix for Crypto/Forex) ---
+# --- 2. SYMBOL SMART FORMATTER ---
 def format_symbol(sym):
-    sym = str(sym).upper()
+    sym = str(sym).upper().replace("/", "")
     # Crypto: BTCUSDT -> BINANCE:BTCUSDT
-    if any(x in sym for x in ["BTC", "ETH", "USDT", "SOL", "DOGE"]):
-        if ":" not in sym:
-            return f"BINANCE:{sym}"
-    # Forex: EURUSD -> OANDA:EUR_USD (Depends on your DB naming)
+    if any(x in sym for x in ["BTC", "ETH", "USDT", "SOL", "DOGE", "SHIB"]):
+        return f"BINANCE:{sym}" if ":" not in sym else sym
+    
+    # Forex: EURUSD -> OANDA:EUR_USD
+    # Finnhub requires underscore for Forex pairs
+    if len(sym) == 6:
+        return f"OANDA:{sym[:3]}_{sym[3:]}"
+    
     return sym
 
-# --- 4. REAL-TIME ENGINE (WebSocket Mode) ---
+# --- 3. OPTIMIZED PRICE ENGINE ---
 def price_engine():
-    """Finnhub WebSocket Engine for 24/7 Live Price"""
+    global last_emit_time
     ws = None
     while True:
         try:
@@ -70,28 +57,26 @@ def price_engine():
                 print("🔌 Connecting to Finnhub WebSocket...")
                 ws = create_connection(f"wss://ws.finnhub.io?token={FINNHUB_KEY}")
             
-            # Subscribe current set of symbols
-            current_subs = list(subscribed_symbols)
-            for sym in current_subs:
+            # Subscribe all symbols with a small delay to avoid 429 error
+            current_list = list(subscribed_symbols)
+            for sym in current_list:
                 formatted = format_symbol(sym)
                 ws.send(json.dumps({"type": "subscribe", "symbol": formatted}))
+                eventlet.sleep(0.1) # 100ms gap
             
             while True:
                 msg = json.loads(ws.recv())
-                if msg['type'] == 'data':
+                if msg.get('type') == 'data':
                     for data in msg['data']:
                         raw_sym = data['s']
-                        # Map back: 'BINANCE:BTCUSDT' -> 'BTCUSDT'
+                        # Map back to original: OANDA:EUR_USD -> EURUSD
                         clean_sym = raw_sym.split(':')[-1].replace('_', '') 
                         
                         new_price = float(data['p'])
-                        old_val = price_cache.get(clean_sym, {}).get('p', "0")
-                        old_price = float(old_val)
+                        old_price = float(price_cache.get(clean_sym, {}).get('p', 0))
 
-                        # Blink Logic
-                        change = "none"
-                        if new_price > old_price: change = "up"
-                        elif new_price < old_price: change = "down"
+                        # Blink logic
+                        change = "up" if new_price > old_price else "down" if new_price < old_price else "none"
 
                         price_cache[clean_sym] = {
                             "s": clean_sym,
@@ -99,76 +84,50 @@ def price_engine():
                             "c": change
                         }
                     
-                    # Live update broadcast
-                    socketio.emit('live_ticks', price_cache)
+                    # Throttling: Emit only every 300ms to save mobile data/battery
+                    current_time = time.time()
+                    if current_time - last_emit_time > 0.3:
+                        socketio.emit('live_ticks', price_cache)
+                        last_emit_time = current_time
                 
                 eventlet.sleep(0.01)
         except Exception as e:
-            print(f"⚠️ WS Connection Lost: {e}. Reconnecting in 5s...")
+            print(f"⚠️ WS Error: {e}. Reconnecting in 10s...")
             ws = None
-            eventlet.sleep(5)
+            eventlet.sleep(10)
 
-# --- 5. API ROUTES ---
+# --- 4. API & SUBSCRIPTION ---
 @app.route('/')
 def home():
-    return jsonify({"status": "Online", "engine": "Titan Forex/Crypto V3"})
+    return jsonify({"status": "Online", "version": "4.0.0", "assets": "Crypto/Forex"})
 
-@app.route('/api/forex')
-def get_forex():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT symbol, name FROM forex")
-        rows = cursor.fetchall()
-        conn.close()
-        return jsonify([{"s": r[0], "d": r[1], "type": "forex"} for r in rows])
-    except: return jsonify([])
-
-@app.route('/api/crypto')
-def get_crypto():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT symbol, name FROM crypto")
-        rows = cursor.fetchall()
-        conn.close()
-        return jsonify([{"s": r[0], "d": r[1], "type": "crypto"} for r in rows])
-    except: return jsonify([])
-
-# ==============================================================================
-# --- 6. UPDATED SUBSCRIPTION LOGIC (BULK SYNC) ---
-# ==============================================================================
 @socketio.on('subscribe')
 def handle_subscription(data):
-    """Purana data aur naya data dono ko ek sath subscribe karega"""
     watchlist = data.get('watchlist', [])
-    
-    # 1. Agar list aa rahi hai (Firebase/Initial load)
-    if isinstance(watchlist, list) and len(watchlist) > 0:
+    if isinstance(watchlist, list):
         for item in watchlist:
             sym = item.get('symbol') or item.get('s')
             if sym:
-                subscribed_symbols.add(sym)
+                subscribed_symbols.add(str(sym))
                 join_room(str(sym))
-        print(f"✅ Bulk Sync: {len(watchlist)} symbols added")
-
-    # 2. Agar single symbol aa raha hai (Manual add)
+        print(f"✅ Sync: {len(watchlist)} symbols active")
     elif data.get('symbol'):
         sym = data.get('symbol')
-        subscribed_symbols.add(sym)
+        subscribed_symbols.add(str(sym))
         join_room(str(sym))
-        print(f"✅ Single Add: {sym}")
 
-# ==============================================================================
-# --- 7. BOOTSTRAP ---
-# ==============================================================================
+# --- 5. DB SYNC ---
+def sync_db():
+    url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{DB_FILE}"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            with open(DB_FILE, "wb") as f: f.write(r.content)
+            print("✅ DB Synced")
+    except: print("❌ DB Sync Failed")
+
 if __name__ == '__main__':
-    # Initial DB sync
-    sync_db_from_supabase()
-    
-    # Background thread for prices
+    sync_db()
     socketio.start_background_task(price_engine)
-    
     port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Server running on port {port}")
     socketio.run(app, host='0.0.0.0', port=port)
