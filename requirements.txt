@@ -9,3 +9,4 @@ websocket-client
 apscheduler
 yfinance
 flask-socketio
+schedule
